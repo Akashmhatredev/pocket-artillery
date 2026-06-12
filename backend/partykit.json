@@ -1,0 +1,6 @@
+{
+  "$schema": "https://www.partykit.io/schema.json",
+  "name": "pocket-artillery",
+  "main": "src/index.ts",
+  "compatibilityDate": "2026-06-12"
+}

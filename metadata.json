@@ -1,0 +1,6 @@
+{
+  "name": "Pocket Artillery",
+  "description": "A modern, premium-quality multiplayer artillery battle game inspired by classic tank games.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
