@@ -1,16 +1,9 @@
-import type { ReplayEvent, RoomState } from "../types";
-
-interface SupabaseMatchPayload {
-  status: "finished" | "aborted";
-  winner_id: string | null;
-  started_at?: string;
-  ended_at: string;
-}
-
 export class ReplaySaver {
-  constructor(private readonly env: Record<string, string | undefined>) {}
+  constructor(env) {
+    this.env = env;
+  }
 
-  async saveFinishedMatch(state: RoomState, events: ReplayEvent[]): Promise<void> {
+  async saveFinishedMatch(state, events) {
     const url = this.env.SUPABASE_URL;
     const serviceKey = this.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -27,7 +20,7 @@ export class ReplaySaver {
       prefer: "resolution=merge-duplicates"
     };
 
-    const matchPayload: SupabaseMatchPayload = {
+    const matchPayload = {
       status: "finished",
       winner_id: winningPlayer?.userId ?? null,
       ended_at: new Date().toISOString()
@@ -56,7 +49,7 @@ export class ReplaySaver {
     });
   }
 
-  private async upsert(url: string, headers: Record<string, string>, body: unknown): Promise<void> {
+  async upsert(url, headers, body) {
     const response = await fetch(url, {
       method: "POST",
       headers,

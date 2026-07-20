@@ -5,13 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "partykit dev",
-    "deploy": "partykit deploy",
-    "typecheck": "tsc --noEmit"
+    "deploy": "partykit deploy"
   },
   "dependencies": {
     "partykit": "^0.0.111"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3"
   }
 }

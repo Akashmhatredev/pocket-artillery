@@ -1,10 +1,7 @@
 import { NextResponse } from "next/server";
 import { normalizeRoomCode } from "@/lib/multiplayer/client";
 
-export async function GET(
-  _request: Request,
-  context: { params: Promise<{ roomCode: string }> }
-) {
+export async function GET(_request, context) {
   const { roomCode } = await context.params;
   const normalized = normalizeRoomCode(roomCode);
 
