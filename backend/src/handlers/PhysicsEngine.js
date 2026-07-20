@@ -1,21 +1,12 @@
-import type {
-  PlayerState,
-  ProjectileSimulation,
-  TerrainModification,
-  Vec2,
-  WeaponConfig,
-  WeaponId
-} from "../types";
-
 export const WORLD = {
   width: 1200,
   height: 800,
   gravity: 0.2,
   maxTicks: 1800,
   tickMs: 16
-} as const;
+};
 
-const WEAPONS: Record<WeaponId, WeaponConfig> = {
+const WEAPONS = {
   standard: { id: "standard", projectileRadius: 5, explosionRadius: 60, damage: 25 },
   cluster: { id: "cluster", projectileRadius: 5, explosionRadius: 45, damage: 15 },
   "cluster-fragment": { id: "cluster-fragment", projectileRadius: 3.5, explosionRadius: 40, damage: 18 },
@@ -23,12 +14,12 @@ const WEAPONS: Record<WeaponId, WeaponConfig> = {
 };
 
 export class PhysicsEngine {
-  readonly width = WORLD.width;
-  readonly height = WORLD.height;
-  readonly gravity = WORLD.gravity;
+  width = WORLD.width;
+  height = WORLD.height;
+  gravity = WORLD.gravity;
 
-  generateTerrain(seed: number): number[] {
-    const terrain = new Array<number>(this.width);
+  generateTerrain(seed) {
+    const terrain = new Array(this.width);
     const offset1 = this.seededRange(seed, 1) * 1000;
     const offset2 = this.seededRange(seed, 2) * 1000;
     const offset3 = this.seededRange(seed, 3) * 1000;
@@ -44,27 +35,27 @@ export class PhysicsEngine {
     return terrain;
   }
 
-  placePlayersOnTerrain(players: PlayerState[], terrain: number[]): PlayerState[] {
+  placePlayersOnTerrain(players, terrain) {
     return players.map((player) => ({
       ...player,
       y: this.getTerrainHeight(terrain, player.x)
     }));
   }
 
-  getWeapon(weaponId: WeaponId | undefined): WeaponConfig {
+  getWeapon(weaponId) {
     return WEAPONS[weaponId ?? "standard"] ?? WEAPONS.standard;
   }
 
   simulateProjectile(
-    projectileId: string,
-    player: PlayerState,
-    terrain: number[],
-    players: PlayerState[],
-    angle: number,
-    power: number,
-    weaponId: WeaponId | undefined,
-    wind: number
-  ): ProjectileSimulation {
+    projectileId,
+    player,
+    terrain,
+    players,
+    angle,
+    power,
+    weaponId,
+    wind
+  ) {
     const weapon = this.getWeapon(weaponId);
     const radians = (this.clamp(angle, 0, 180) * Math.PI) / 180;
     const speed = this.clamp(power, 1, 100) * 0.35 + 2;
@@ -77,7 +68,7 @@ export class PhysicsEngine {
       y: -Math.sin(radians) * speed
     };
 
-    const steps: Vec2[] = [];
+    const steps = [];
     let x = start.x;
     let y = start.y;
     let vx = velocity.x;
@@ -112,16 +103,16 @@ export class PhysicsEngine {
   }
 
   applyExplosion(
-    terrain: number[],
-    players: PlayerState[],
-    center: Vec2,
-    radius: number,
-    damage: number
-  ): { terrain: number[]; terrainMod: TerrainModification; players: PlayerState[] } {
+    terrain,
+    players,
+    center,
+    radius,
+    damage
+  ) {
     const nextTerrain = [...terrain];
     const fromX = Math.max(0, Math.floor(center.x - radius));
     const toX = Math.min(this.width - 1, Math.floor(center.x + radius));
-    const heights: number[] = [];
+    const heights = [];
 
     for (let x = fromX; x <= toX; x++) {
       const dx = x - center.x;
@@ -155,23 +146,23 @@ export class PhysicsEngine {
     };
   }
 
-  getDamageMap(before: PlayerState[], after: PlayerState[]): Record<string, number> {
+  getDamageMap(before, after) {
     return Object.fromEntries(
       before
         .map((player) => {
           const next = after.find((candidate) => candidate.id === player.id);
-          return [player.id, Math.max(0, player.hp - (next?.hp ?? player.hp))] as const;
+          return [player.id, Math.max(0, player.hp - (next?.hp ?? player.hp))];
         })
         .filter(([, damage]) => damage > 0)
     );
   }
 
-  clamp(value: number, min: number, max: number): number {
+  clamp(value, min, max) {
     if (!Number.isFinite(value)) return min;
     return Math.min(max, Math.max(min, value));
   }
 
-  private hasCollided(point: Vec2, terrain: number[], players: PlayerState[]): boolean {
+  hasCollided(point, terrain, players) {
     const ix = Math.floor(point.x);
 
     if (point.y > this.height || point.x < 0 || point.x > this.width) {
@@ -188,13 +179,13 @@ export class PhysicsEngine {
     });
   }
 
-  private getTerrainHeight(terrain: number[], x: number): number {
+  getTerrainHeight(terrain, x) {
     const ix = Math.floor(x);
     if (ix >= 0 && ix < this.width) return terrain[ix];
     return this.height;
   }
 
-  private seededRange(seed: number, salt: number): number {
+  seededRange(seed, salt) {
     let value = seed + salt * 0x9e3779b9;
     value = Math.imul(value ^ (value >>> 16), 0x85ebca6b);
     value = Math.imul(value ^ (value >>> 13), 0xc2b2ae35);
@@ -202,7 +193,7 @@ export class PhysicsEngine {
     return value / 0xffffffff;
   }
 
-  private roundPoint(point: Vec2): Vec2 {
+  roundPoint(point) {
     return {
       x: Math.round(point.x * 100) / 100,
       y: Math.round(point.y * 100) / 100

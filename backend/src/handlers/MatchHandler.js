@@ -1,43 +1,24 @@
-import type { Connection, Party } from "partykit/server";
-import type {
-  ClientEvent,
-  ClientFireEvent,
-  DamageEntry,
-  PlayerState,
-  ReplayEvent,
-  RoomState,
-  ServerErrorEvent,
-  ServerImpactEvent,
-  ServerJoinedEvent,
-  ServerMatchEndEvent,
-  ServerMatchStartEvent,
-  ServerProjectileEvent,
-  ServerSyncStateEvent,
-  ServerTurnStartEvent,
-  WeaponId
-} from "../types";
 import { PhysicsEngine, WORLD } from "./PhysicsEngine";
 import { ReplaySaver } from "./ReplaySaver";
 
-const PLAYER_COLORS = ["#22d3ee", "#fb7185"] as const;
-const PLAYER_NAMES = ["Alpha", "Omega"] as const;
+const PLAYER_COLORS = ["#22d3ee", "#fb7185"];
+const PLAYER_NAMES = ["Alpha", "Omega"];
 const RECONNECT_GRACE_MS = 60_000;
 
 export class MatchHandler {
-  private readonly physics = new PhysicsEngine();
-  private readonly replaySaver: ReplaySaver;
-  private state: RoomState;
-  private replay: ReplayEvent[] = [];
-  private startedAt = Date.now();
-  private impactTimer: ReturnType<typeof setTimeout> | null = null;
-  private pauseTimer: ReturnType<typeof setTimeout> | null = null;
+  physics = new PhysicsEngine();
+  replay = [];
+  startedAt = Date.now();
+  impactTimer = null;
+  pauseTimer = null;
 
-  constructor(private readonly party: Party) {
-    this.replaySaver = new ReplaySaver((party.env ?? {}) as Record<string, string | undefined>);
+  constructor(party) {
+    this.party = party;
+    this.replaySaver = new ReplaySaver(party.env ?? {});
     this.state = this.createInitialState();
   }
 
-  handleJoin(conn: Connection): void {
+  handleJoin(conn) {
     this.send(conn, {
       type: "JOINED",
       playerId: null,
@@ -47,7 +28,7 @@ export class MatchHandler {
     this.sendSync(conn);
   }
 
-  handleClose(conn: Connection): void {
+  handleClose(conn) {
     const player = this.state.players.find((candidate) => candidate.connectionId === conn.id);
     if (!player || this.state.status === "finished") return;
 
@@ -67,7 +48,7 @@ export class MatchHandler {
     this.scheduleForfeit(player.id);
   }
 
-  async processEvent(event: ClientEvent, sender: Connection): Promise<void> {
+  async processEvent(event, sender) {
     try {
       switch (event.type) {
         case "HELLO":
@@ -91,7 +72,7 @@ export class MatchHandler {
     }
   }
 
-  private handleHello(event: Extract<ClientEvent, { type: "HELLO" }>, conn: Connection): void {
+  handleHello(event, conn) {
     const existing = event.playerId
       ? this.state.players.find((player) => player.id === event.playerId)
       : undefined;
@@ -136,7 +117,7 @@ export class MatchHandler {
       playerId: target.id,
       slot: target.slot,
       roomId: this.state.id
-    } satisfies ServerJoinedEvent);
+    });
     this.broadcastSync();
 
     if (this.state.status === "waiting" && this.state.players.length === 2 && this.connectedPlayerCount() === 2) {
@@ -144,7 +125,7 @@ export class MatchHandler {
     }
   }
 
-  private handleAim(angle: number | undefined, power: number | undefined, conn: Connection): void {
+  handleAim(angle, power, conn) {
     const player = this.requirePlayer(conn);
     if (!player || this.state.status !== "playing") return;
 
@@ -164,7 +145,7 @@ export class MatchHandler {
     this.broadcastSync();
   }
 
-  private handleFire(event: ClientFireEvent, conn: Connection): void {
+  handleFire(event, conn) {
     const player = this.requirePlayer(conn);
     if (!player) return;
     if (this.state.status !== "playing") {
@@ -207,7 +188,7 @@ export class MatchHandler {
       players: playersForSimulation
     };
 
-    const projectileEvent: ServerProjectileEvent = {
+    const projectileEvent = {
       type: "SERVER_PROJECTILE_SPAWNED",
       id: projectile.id,
       playerId: player.id,
@@ -224,7 +205,7 @@ export class MatchHandler {
     this.scheduleImpact(projectile);
   }
 
-  private scheduleImpact(projectile: ReturnType<PhysicsEngine["simulateProjectile"]>): void {
+  scheduleImpact(projectile) {
     if (this.impactTimer) clearTimeout(this.impactTimer);
 
     this.impactTimer = setTimeout(() => {
@@ -237,7 +218,7 @@ export class MatchHandler {
         projectile.weapon.damage
       );
       const damageMap = this.physics.getDamageMap(beforePlayers, result.players);
-      const affectedPlayers: DamageEntry[] = result.players
+      const affectedPlayers = result.players
         .map((player) => ({
           playerId: player.id,
           damage: damageMap[player.id] ?? 0,
@@ -262,7 +243,7 @@ export class MatchHandler {
         winnerId
       };
 
-      const impactEvent: ServerImpactEvent = {
+      const impactEvent = {
         type: "SERVER_IMPACT",
         projectileId: projectile.id,
         x: projectile.impact.x,
@@ -285,7 +266,7 @@ export class MatchHandler {
     }, projectile.tti);
   }
 
-  private startMatch(): void {
+  startMatch() {
     const terrainSeed = this.state.terrainSeed || this.randomSeed();
     const terrain = this.physics.generateTerrain(terrainSeed);
     const players = this.physics.placePlayersOnTerrain(this.state.players, terrain);
@@ -302,7 +283,7 @@ export class MatchHandler {
     };
     this.startedAt = Date.now();
 
-    const event: ServerMatchStartEvent = {
+    const event = {
       type: "MATCH_START",
       state: this.state
     };
@@ -311,7 +292,7 @@ export class MatchHandler {
     this.broadcastTurnStart();
   }
 
-  private endMatch(): void {
+  endMatch() {
     this.state = {
       ...this.state,
       status: "finished",
@@ -319,7 +300,7 @@ export class MatchHandler {
       disconnectDeadlineAt: null
     };
 
-    const event: ServerMatchEndEvent = {
+    const event = {
       type: "MATCH_END",
       winnerId: this.state.winnerId,
       state: this.state
@@ -332,11 +313,11 @@ export class MatchHandler {
     });
   }
 
-  private broadcastTurnStart(): void {
+  broadcastTurnStart() {
     const player = this.state.players[this.state.activePlayerIndex];
     if (!player) return;
 
-    const event: ServerTurnStartEvent = {
+    const event = {
       type: "TURN_START",
       playerId: player.id,
       playerIndex: this.state.activePlayerIndex,
@@ -346,7 +327,7 @@ export class MatchHandler {
     this.broadcast(event);
   }
 
-  private attachConnection(conn: Connection, clientId?: string): PlayerState | null {
+  attachConnection(conn, clientId) {
     const current = this.state.players.find((player) => player.connectionId === conn.id);
     if (current) return current;
 
@@ -361,7 +342,7 @@ export class MatchHandler {
     return player;
   }
 
-  private createInitialState(): RoomState {
+  createInitialState() {
     const terrainSeed = this.randomSeed();
     return {
       id: this.party.id,
@@ -380,7 +361,7 @@ export class MatchHandler {
     };
   }
 
-  private createPlayer(connectionId: string, slot: number, clientId?: string): PlayerState {
+  createPlayer(connectionId, slot, clientId) {
     return {
       id: crypto.randomUUID(),
       clientId,
@@ -402,7 +383,7 @@ export class MatchHandler {
     };
   }
 
-  private requirePlayer(conn: Connection): PlayerState | null {
+  requirePlayer(conn) {
     const player = this.state.players.find((candidate) => candidate.connectionId === conn.id);
     if (!player) {
       this.sendError(conn, "PLAYER_REQUIRED", "Join the room before sending gameplay events.");
@@ -411,7 +392,7 @@ export class MatchHandler {
     return player;
   }
 
-  private nextLivingPlayerIndex(currentIndex: number, players: PlayerState[]): number {
+  nextLivingPlayerIndex(currentIndex, players) {
     for (let offset = 1; offset <= players.length; offset++) {
       const index = (currentIndex + offset) % players.length;
       if (players[index]?.hp > 0) return index;
@@ -419,7 +400,7 @@ export class MatchHandler {
     return currentIndex;
   }
 
-  private scheduleForfeit(playerId: string): void {
+  scheduleForfeit(playerId) {
     this.clearPauseTimer();
     this.pauseTimer = setTimeout(() => {
       if (this.state.status !== "paused") return;
@@ -439,67 +420,67 @@ export class MatchHandler {
     }, RECONNECT_GRACE_MS);
   }
 
-  private clearPauseTimer(): void {
+  clearPauseTimer() {
     if (this.pauseTimer) {
       clearTimeout(this.pauseTimer);
       this.pauseTimer = null;
     }
   }
 
-  private connectedPlayerCount(): number {
+  connectedPlayerCount() {
     return this.state.players.filter((player) => player.connected).length;
   }
 
-  private broadcastSync(): void {
+  broadcastSync() {
     this.broadcast({
       type: "SYNC_STATE",
       state: this.state
-    } satisfies ServerSyncStateEvent);
+    });
   }
 
-  private sendSync(conn: Connection): void {
+  sendSync(conn) {
     this.send(conn, {
       type: "SYNC_STATE",
       state: this.state
-    } satisfies ServerSyncStateEvent);
+    });
   }
 
-  private broadcast(payload: unknown): void {
+  broadcast(payload) {
     this.party.broadcast(JSON.stringify(payload));
   }
 
-  private send(conn: Connection, payload: unknown): void {
+  send(conn, payload) {
     conn.send(JSON.stringify(payload));
   }
 
-  private sendError(conn: Connection, code: string, message: string): void {
+  sendError(conn, code, message) {
     this.send(conn, {
       type: "ERROR",
       code,
       message
-    } satisfies ServerErrorEvent);
+    });
   }
 
-  private record(type: string, payload: unknown): void {
+  record(type, payload) {
     this.replay.push({
       tick: Date.now() - this.startedAt,
       type,
       payload
-    } satisfies ReplayEvent);
+    });
   }
 
-  private normalizeWeapon(weaponId: WeaponId | undefined): WeaponId {
+  normalizeWeapon(weaponId) {
     if (weaponId === "cluster" || weaponId === "nuke" || weaponId === "standard") {
       return weaponId;
     }
     return "standard";
   }
 
-  private randomSeed(): number {
+  randomSeed() {
     return Math.floor(Math.random() * 0x7fffffff);
   }
 
-  private safeName(name: string | undefined): string | undefined {
+  safeName(name) {
     const trimmed = name?.trim();
     return trimmed ? trimmed.slice(0, 24) : undefined;
   }
