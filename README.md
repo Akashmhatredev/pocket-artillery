@@ -10,8 +10,8 @@
   <img alt="Next.js" src="https://img.shields.io/badge/Next.js-15-000000?style=for-the-badge&logo=next.js&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-19-149ECA?style=for-the-badge&logo=react&logoColor=white" />
   <img alt="Tailwind CSS" src="https://img.shields.io/badge/Tailwind-4-06B6D4?style=for-the-badge&logo=tailwindcss&logoColor=white" />
-  <img alt="PartyKit" src="https://img.shields.io/badge/PartyKit-Realtime-FF3E00?style=for-the-badge" />
-  <img alt="Supabase" src="https://img.shields.io/badge/Supabase-Postgres-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white" />
+  <img alt="SpacetimeDB" src="https://img.shields.io/badge/SpacetimeDB-Realtime%20DB-6E56CF?style=for-the-badge" />
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-Module-000000?style=for-the-badge&logo=rust&logoColor=white" />
 </p>
 
 <p>
@@ -96,22 +96,26 @@ Open **http://localhost:3000** to enter the war room.
 
 ### 2. Backend (multiplayer)
 
-The real-time layer runs on **PartyKit**. In a second terminal:
+The real-time layer runs on **SpacetimeDB** — a single Rust/WASM module
+(`stdb-module/`) that holds all game state and runs the authoritative physics.
+In a second terminal:
 
 ```bash
-cd backend
-npm install
-npm run dev        # note the port it prints (e.g. localhost:1999)
+spacetime start                                              # local instance on :3000
+spacetime publish -p stdb-module --server local pocket-artillery
+npm run stdb:generate                                        # generate TS client bindings
 ```
 
 Then point the frontend at it via `.env.local`:
 
 ```bash
-NEXT_PUBLIC_PARTYKIT_HOST="localhost:1999"
-NEXT_PUBLIC_PARTYKIT_PARTY="main"
+NEXT_PUBLIC_SPACETIMEDB_URI="ws://localhost:3000"
+NEXT_PUBLIC_SPACETIMEDB_MODULE="pocket-artillery"
 ```
 
-> 💡 Single-player / local skirmish works without the backend — spin up PartyKit only when you want live multiplayer matches.
+> 💡 Single-player / local skirmish works without the backend — spin up SpacetimeDB only when you want live multiplayer matches.
+
+📄 Full setup + production deploy (Maincloud + Vercel): [`SPACETIMEDB_DEPLOY.md`](./SPACETIMEDB_DEPLOY.md)
 
 ---
 
@@ -120,27 +124,26 @@ NEXT_PUBLIC_PARTYKIT_PARTY="main"
 Pocket Artillery uses a **server-authoritative, room-based** model — the client renders and predicts, the server decides.
 
 ```
-┌────────────────┐      WebSocket      ┌────────────────┐      ┌────────────────┐
-│    Frontend    │ ◀─────────────────▶ │    PartyKit    │ ────▶│    Supabase    │
-│ Next.js/React  │   moves & sync      │  match server  │      │  Postgres      │
-│  canvas engine │                     │ authoritative  │      │ users·matches  │
-│ client predict │                     │ physics·turns  │      │ ·replays       │
-└────────────────┘                     └────────────────┘      └────────────────┘
+┌────────────────┐    WebSocket (subscribe + reducers)   ┌──────────────────────┐
+│    Frontend    │ ◀───────────────────────────────────▶ │     SpacetimeDB      │
+│ Next.js/React  │        table sync (auto)              │   Rust/WASM module   │
+│  canvas engine │        reducer calls (fire/aim)       │ tables + reducers +  │
+│ client predict │                                       │ authoritative physics│
+└────────────────┘                                       └──────────────────────┘
 ```
 
 | Layer | Responsibility |
 | :---- | :------------- |
 | **Frontend** | Rendering, local aiming previews, client-side prediction, audio & particles. |
-| **PartyKit** | Turn management, deterministic projectile physics, collision, damage, terrain triggers. |
-| **Supabase** | Persistent users, historical rooms, matches, and saved replays. |
+| **SpacetimeDB** | One WASM module = realtime backend **and** database: turn management, deterministic projectile physics, collision, damage, terrain, and persistent match/replay state — all in tables + reducers. |
 
-📄 Full design & migration notes: [`MULTIPLAYER_ARCHITECTURE.md`](./MULTIPLAYER_ARCHITECTURE.md)
+📄 SpacetimeDB + Vercel deployment: [`SPACETIMEDB_DEPLOY.md`](./SPACETIMEDB_DEPLOY.md) · Original design notes: [`MULTIPLAYER_ARCHITECTURE.md`](./MULTIPLAYER_ARCHITECTURE.md)
 
 ---
 
 ## 🧰 Tech Stack
 
-**Next.js 15** · **React 19** · **Tailwind CSS 4** · **Framer Motion** · **lucide-react** · **PartyKit** · **Supabase** · **Google Gemini API**
+**Next.js 15** · **React 19** · **Tailwind CSS 4** · **Framer Motion** · **lucide-react** · **SpacetimeDB** (Rust/WASM) · **Google Gemini API**
 
 ---
 

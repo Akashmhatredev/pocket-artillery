@@ -26,10 +26,10 @@ import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import {
     MULTIPLAYER_STORAGE_KEY,
-    MultiplayerConnection,
     getOrCreateClientId,
     normalizeRoomCode
 } from '@/lib/multiplayer/client';
+import { MultiplayerConnection } from '@/lib/multiplayer/spacetime';
 
 function cn(...inputs) {
     return twMerge(clsx(inputs));
