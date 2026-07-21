@@ -86,14 +86,19 @@ cp .env.example .env.local
 #   NEXT_PUBLIC_SPACETIMEDB_URI="ws://localhost:3000"
 #   NEXT_PUBLIC_SPACETIMEDB_MODULE="pocket-artillery"
 
-# (e) Run the app
+# (e) Run the app (on :3001 — SpacetimeDB owns :3000)
 npm install
 npm run dev
 ```
 
-Open **http://localhost:3000**, create a room in one tab, and join with the
+Open **http://localhost:3001**, create a room in one tab, and join with the
 room code from a second tab (or another browser) to test a live match.
 Single-player works with no backend running at all.
+
+> ⚠️ **Port collision:** SpacetimeDB's local server and Next.js both default to
+> port **3000**. `npm run dev` is configured to run the app on **3001** so the
+> two don't fight. The frontend still connects to SpacetimeDB at
+> `ws://localhost:3000` (set in `.env.local`).
 
 **After any change to `stdb-module/src/lib.rs`:** re-run (b) and (c):
 
@@ -198,6 +203,8 @@ long-lived data to preserve, `--delete-data` is usually fine in development.
 | `next build` fails on `@/module_bindings` | You haven't generated bindings yet. Run `npm run stdb:generate` and commit the result. |
 | Multiplayer shows a "bindings have not been generated" error at runtime | Same as above — the placeholder stub is still in place. |
 | `spacetime publish` reports an ABI / version mismatch | Align `spacetimedb` crate version in `stdb-module/Cargo.toml` with your CLI (`spacetime --version`). |
+| `WebSocket connection to 'wss://maincloud.spacetimedb.com/v1/database/<name>/subscribe' failed` | The database doesn't exist on that server (not published there) **or** the name in `NEXT_PUBLIC_SPACETIMEDB_MODULE` doesn't match. Run `spacetime list --server maincloud` to see what you've actually published, and set the env var to that exact name. Publishing to `local` does **not** put it on Maincloud. |
 | Browser can't connect in production | Confirm `NEXT_PUBLIC_SPACETIMEDB_URI` is `wss://…` (not `ws://`) and the module name matches exactly what `spacetime publish --server maincloud` printed. |
+| WebSocket fails on `ws://localhost:3000` locally | Make sure `spacetime start` is actually running on :3000 and the app is on a different port (`npm run dev` uses :3001). Both default to 3000 and will collide. |
 | Match never starts with two players | Both players must hold an open connection. This is normal in the real app; note that one-shot `spacetime call` commands can't simulate two persistent clients. |
 | Want to self-host instead of Maincloud | Run `spacetime start` (or `spacetimedb-standalone`) on a VM/container behind TLS, publish there with `--server <your-url>`, and set `NEXT_PUBLIC_SPACETIMEDB_URI` to its `wss://` address. |
