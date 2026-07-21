@@ -92,7 +92,9 @@ cp .env.example .env.local   # then edit GEMINI_API_KEY
 npm run dev
 ```
 
-Open **http://localhost:3000** to enter the war room.
+Open **http://localhost:3001** to enter the war room.
+
+> ⚠️ The app runs on **:3001** because SpacetimeDB's local server uses **:3000** — they'd otherwise collide. `npm run dev` sets this for you.
 
 ### 2. Backend (multiplayer)
 
