@@ -7,7 +7,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "clean": "next clean"
+    "clean": "next clean",
+    "stdb:generate": "spacetime generate --lang typescript --out-dir module_bindings --module-path stdb-module",
+    "stdb:publish": "spacetime publish -p stdb-module pocket-artillery",
+    "stdb:start": "spacetime start"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -22,6 +25,7 @@
     "postcss": "^8.5.6",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
+    "spacetimedb": "^2.6.1",
     "tailwind-merge": "^3.3.1"
   },
   "devDependencies": {

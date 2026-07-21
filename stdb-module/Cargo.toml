@@ -1,0 +1,20 @@
+[package]
+name = "pocket-artillery-module"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pin to the SpacetimeDB version your `spacetime` CLI reports (`spacetime --version`).
+# Keep this in sync with the CLI to avoid ABI mismatches when publishing.
+spacetimedb = "1.0"
+log = "0.4"
+
+[profile.release]
+# Smaller wasm artifacts publish faster.
+opt-level = "z"
+lto = true
+codegen-units = 1
