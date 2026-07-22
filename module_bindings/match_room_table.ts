@@ -21,5 +21,6 @@ export default __t.row({
   winnerIdentity: __t.option(__t.identity()).name("winner_identity"),
   turnStartedAt: __t.option(__t.timestamp()).name("turn_started_at"),
   disconnectDeadline: __t.option(__t.timestamp()).name("disconnect_deadline"),
+  turnId: __t.u64().name("turn_id"),
   terrain: __t.array(__t.f32()),
 });

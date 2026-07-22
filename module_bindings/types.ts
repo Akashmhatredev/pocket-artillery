@@ -37,6 +37,7 @@ export const MatchRoom = __t.object("MatchRoom", {
   winnerIdentity: __t.option(__t.identity()),
   turnStartedAt: __t.option(__t.timestamp()),
   disconnectDeadline: __t.option(__t.timestamp()),
+  turnId: __t.u64(),
   terrain: __t.array(__t.f32()),
 });
 export type MatchRoom = __Infer<typeof MatchRoom>;
@@ -56,6 +57,7 @@ export const Player = __t.object("Player", {
   ammoStandard: __t.u32(),
   ammoCluster: __t.u32(),
   ammoNuke: __t.u32(),
+  selectedWeapon: __t.string(),
   clientId: __t.string(),
 });
 export type Player = __Infer<typeof Player>;
@@ -75,4 +77,12 @@ export const Projectile = __t.object("Projectile", {
   ttiMs: __t.u64(),
 });
 export type Projectile = __Infer<typeof Projectile>;
+
+export const TurnTimer = __t.object("TurnTimer", {
+  scheduledId: __t.u64(),
+  scheduledAt: __t.scheduleAt(),
+  roomCode: __t.string(),
+  turnId: __t.u64(),
+});
+export type TurnTimer = __Infer<typeof TurnTimer>;
 

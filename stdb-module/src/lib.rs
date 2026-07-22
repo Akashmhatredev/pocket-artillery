@@ -20,6 +20,7 @@ const GRAVITY: f32 = 0.2;
 const MAX_TICKS: u64 = 1800;
 const TICK_MS: u64 = 16;
 const RECONNECT_GRACE_MS: i64 = 60_000;
+const TURN_MS: i64 = 30_000;
 
 const PLAYER_COLORS: [&str; 2] = ["#22d3ee", "#fb7185"];
 const PLAYER_NAMES: [&str; 2] = ["Alpha", "Omega"];
@@ -45,6 +46,9 @@ pub struct MatchRoom {
     pub winner_identity: Option<Identity>,
     pub turn_started_at: Option<Timestamp>,
     pub disconnect_deadline: Option<Timestamp>,
+    /// Turn generation counter; a scheduled turn timeout only fires if its
+    /// captured turn_id still matches (stale timers are no-ops).
+    pub turn_id: u64,
     /// Full terrain heightmap, one entry per horizontal pixel (length == WIDTH).
     pub terrain: Vec<f32>,
 }
@@ -69,6 +73,9 @@ pub struct Player {
     pub ammo_standard: u32,
     pub ammo_cluster: u32,
     pub ammo_nuke: u32,
+    /// Currently selected weapon ("standard" | "cluster" | "nuke"); used when
+    /// the turn clock expires and the server auto-fires on the player's behalf.
+    pub selected_weapon: String,
     /// Browser-scoped id (survives identity churn across tabs); informational.
     pub client_id: String,
 }
@@ -114,6 +121,18 @@ pub struct ForfeitTimer {
     pub scheduled_at: ScheduleAt,
     pub room_code: String,
     pub player_identity: Identity,
+}
+
+/// Scheduled one-shot: fires `process_turn_timeout` when the 30s turn clock
+/// runs out. Carries the turn_id it was armed for so stale timers are ignored.
+#[table(name = turn_timer, scheduled(process_turn_timeout))]
+pub struct TurnTimer {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+    pub room_code: String,
+    pub turn_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +216,7 @@ pub fn join_match(
                 winner_identity: None,
                 turn_started_at: None,
                 disconnect_deadline: None,
+                turn_id: 0,
                 terrain: Vec::new(),
             })
         }
@@ -229,6 +249,11 @@ pub fn join_match(
     if room.status == "paused" && connected >= 2 {
         room.status = "playing".to_string();
         room.disconnect_deadline = None;
+        // Restart the active player's turn clock — unless a shot is mid-air,
+        // in which case its impact will begin the next turn.
+        if !projectile_in_flight(ctx, &code) {
+            begin_turn(ctx, &mut room);
+        }
         ctx.db.match_room().room_code().update(room.clone());
     }
 
@@ -273,7 +298,7 @@ pub fn fire_weapon(
     power: f32,
     weapon_id: String,
 ) -> Result<(), String> {
-    let mut player = ctx
+    let player = ctx
         .db
         .player()
         .identity()
@@ -292,55 +317,24 @@ pub fn fire_weapon(
     if room.active_player_slot != player.slot {
         return Err("Only the active player can fire.".to_string());
     }
-
-    let wid = normalize_weapon(&weapon_id);
-    let ammo = match wid {
-        "cluster" => player.ammo_cluster,
-        "nuke" => player.ammo_nuke,
-        _ => player.ammo_standard,
-    };
-    if ammo == 0 {
-        return Err(format!("No ammo remaining for {wid}."));
+    if projectile_in_flight(ctx, &player.room_code) {
+        return Err("A shot is already in flight.".to_string());
     }
 
-    // Deduct ammo and commit the shot's aim.
-    match wid {
-        "cluster" => player.ammo_cluster -= 1,
-        "nuke" => player.ammo_nuke -= 1,
-        _ => player.ammo_standard -= 1,
-    }
-    let angle = clamp(angle, 0.0, 180.0);
-    let power = clamp(power, 1.0, 100.0);
-    player.angle = angle;
-    player.power = power;
-    ctx.db.player().identity().update(player.clone());
+    launch_shot(ctx, player, &room, angle, power, normalize_weapon(&weapon_id))
+}
 
-    let players = players_in(ctx, &player.room_code);
-    let w = weapon(wid);
-    let sim = simulate_projectile(&player, &room.terrain, &players, angle, power, room.wind);
-
-    let proj = ctx.db.projectile().insert(Projectile {
-        id: 0,
-        room_code: player.room_code.clone(),
-        player_identity: ctx.sender,
-        weapon_id: wid.to_string(),
-        start_x: sim.start_x,
-        start_y: sim.start_y,
-        vx: sim.vx,
-        vy: sim.vy,
-        impact_x: sim.impact_x,
-        impact_y: sim.impact_y,
-        radius: w.explosion_radius,
-        tti_ms: sim.tti_ms,
-    });
-
-    ctx.db.impact_timer().insert(ImpactTimer {
-        scheduled_id: 0,
-        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, sim.tti_ms as i64)),
-        room_code: player.room_code.clone(),
-        projectile_id: proj.id,
-    });
-
+/// Remember the caller's weapon choice so a turn timeout fires the right one.
+#[reducer]
+pub fn select_weapon(ctx: &ReducerContext, weapon_id: String) -> Result<(), String> {
+    let mut player = ctx
+        .db
+        .player()
+        .identity()
+        .find(ctx.sender)
+        .ok_or("Join a room before selecting a weapon.")?;
+    player.selected_weapon = normalize_weapon(&weapon_id).to_string();
+    ctx.db.player().identity().update(player);
     Ok(())
 }
 
@@ -431,13 +425,61 @@ pub fn process_impact(ctx: &ReducerContext, timer: ImpactTimer) -> Result<(), St
         room.turn_started_at = None;
     } else {
         room.active_player_slot = next_living_slot(room.active_player_slot, &players);
-        room.turn_started_at = Some(ctx.timestamp);
+        begin_turn(ctx, &mut room);
     }
     ctx.db.match_room().room_code().update(room);
 
     // Deleting the projectile is the client's cue to render the explosion.
     ctx.db.projectile().id().delete(proj.id);
     Ok(())
+}
+
+/// Auto-fire for the active player once the 30s turn clock expires.
+#[reducer]
+pub fn process_turn_timeout(ctx: &ReducerContext, timer: TurnTimer) -> Result<(), String> {
+    if ctx.sender != ctx.identity() {
+        return Err("Scheduled reducers cannot be called by clients.".to_string());
+    }
+
+    let Some(mut room) = ctx.db.match_room().room_code().find(&timer.room_code) else {
+        return Ok(());
+    };
+    // Stale timer: the turn already ended (shot resolved, pause, match over).
+    if room.status != "playing" || room.turn_id != timer.turn_id {
+        return Ok(());
+    }
+    // The player fired at the buzzer; the in-flight shot will resolve the turn.
+    if projectile_in_flight(ctx, &timer.room_code) {
+        return Ok(());
+    }
+    let Some(player) = players_in(ctx, &timer.room_code)
+        .into_iter()
+        .find(|p| p.slot == room.active_player_slot && p.hp > 0)
+    else {
+        return Ok(());
+    };
+
+    // Fire their current aim; fall back to standard if the pick is out of ammo.
+    let mut wid = normalize_weapon(&player.selected_weapon);
+    let ammo = match wid {
+        "cluster" => player.ammo_cluster,
+        "nuke" => player.ammo_nuke,
+        _ => player.ammo_standard,
+    };
+    if ammo == 0 {
+        wid = "standard";
+    }
+    if wid == "standard" && player.ammo_standard == 0 {
+        // Nothing left to fire — pass the turn instead.
+        let players = players_in(ctx, &timer.room_code);
+        room.active_player_slot = next_living_slot(room.active_player_slot, &players);
+        begin_turn(ctx, &mut room);
+        ctx.db.match_room().room_code().update(room);
+        return Ok(());
+    }
+
+    let (angle, power) = (player.angle, player.power);
+    launch_shot(ctx, player, &room, angle, power, wid)
 }
 
 /// Award the match to the remaining player if their opponent never reconnects.
@@ -504,9 +546,89 @@ fn seat_new_player(
         ammo_standard: 99,
         ammo_cluster: 3,
         ammo_nuke: 1,
+        selected_weapon: "standard".to_string(),
         client_id: client_id.to_string(),
     });
     Ok(())
+}
+
+/// Deduct ammo, commit the shot's aim, simulate the arc, insert the projectile
+/// row, and schedule its impact. Shared by `fire_weapon` (manual) and
+/// `process_turn_timeout` (auto-fire), so the shooter comes from `player`,
+/// not `ctx.sender`.
+fn launch_shot(
+    ctx: &ReducerContext,
+    mut player: Player,
+    room: &MatchRoom,
+    angle: f32,
+    power: f32,
+    wid: &'static str,
+) -> Result<(), String> {
+    let ammo = match wid {
+        "cluster" => player.ammo_cluster,
+        "nuke" => player.ammo_nuke,
+        _ => player.ammo_standard,
+    };
+    if ammo == 0 {
+        return Err(format!("No ammo remaining for {wid}."));
+    }
+
+    match wid {
+        "cluster" => player.ammo_cluster -= 1,
+        "nuke" => player.ammo_nuke -= 1,
+        _ => player.ammo_standard -= 1,
+    }
+    let angle = clamp(angle, 0.0, 180.0);
+    let power = clamp(power, 1.0, 100.0);
+    player.angle = angle;
+    player.power = power;
+    player.selected_weapon = wid.to_string();
+    ctx.db.player().identity().update(player.clone());
+
+    let players = players_in(ctx, &player.room_code);
+    let w = weapon(wid);
+    let sim = simulate_projectile(&player, &room.terrain, &players, angle, power, room.wind);
+
+    let proj = ctx.db.projectile().insert(Projectile {
+        id: 0,
+        room_code: player.room_code.clone(),
+        player_identity: player.identity,
+        weapon_id: wid.to_string(),
+        start_x: sim.start_x,
+        start_y: sim.start_y,
+        vx: sim.vx,
+        vy: sim.vy,
+        impact_x: sim.impact_x,
+        impact_y: sim.impact_y,
+        radius: w.explosion_radius,
+        tti_ms: sim.tti_ms,
+    });
+
+    ctx.db.impact_timer().insert(ImpactTimer {
+        scheduled_id: 0,
+        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, sim.tti_ms as i64)),
+        room_code: player.room_code.clone(),
+        projectile_id: proj.id,
+    });
+
+    Ok(())
+}
+
+/// Start a fresh turn clock: bump the turn generation, stamp the start time,
+/// and arm the 30s auto-fire timeout. Mutates `room`; the caller commits it.
+fn begin_turn(ctx: &ReducerContext, room: &mut MatchRoom) {
+    room.turn_id += 1;
+    room.turn_started_at = Some(ctx.timestamp);
+    ctx.db.turn_timer().insert(TurnTimer {
+        scheduled_id: 0,
+        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, TURN_MS)),
+        room_code: room.room_code.clone(),
+        turn_id: room.turn_id,
+    });
+}
+
+fn projectile_in_flight(ctx: &ReducerContext, code: &str) -> bool {
+    ctx.db.projectile().iter().any(|p| p.room_code == code)
 }
 
 fn start_match(ctx: &ReducerContext, code: &str) -> Result<(), String> {
@@ -526,9 +648,9 @@ fn start_match(ctx: &ReducerContext, code: &str) -> Result<(), String> {
     room.terrain = terrain;
     room.status = "playing".to_string();
     room.active_player_slot = 0;
-    room.turn_started_at = Some(ctx.timestamp);
     room.disconnect_deadline = None;
     room.winner_identity = None;
+    begin_turn(ctx, &mut room);
     ctx.db.match_room().room_code().update(room);
     Ok(())
 }
