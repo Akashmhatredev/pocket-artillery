@@ -25,5 +25,6 @@ export default __t.row({
   ammoStandard: __t.u32().name("ammo_standard"),
   ammoCluster: __t.u32().name("ammo_cluster"),
   ammoNuke: __t.u32().name("ammo_nuke"),
+  selectedWeapon: __t.string().name("selected_weapon"),
   clientId: __t.string().name("client_id"),
 });

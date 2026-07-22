@@ -17,6 +17,7 @@ import {
     Shield,
     Skull,
     Target,
+    Timer,
     User,
     Users,
     WifiOff,
@@ -49,6 +50,10 @@ const WEAPONS = [
 ];
 
 const DEFAULT_PLAYER_NAME = 'Commander';
+
+// Seconds each player gets to aim and pick a weapon before the shot fires
+// automatically. Must match TURN_MS in stdb-module/src/lib.rs.
+const TURN_SECONDS = 30;
 
 const GameSlider = ({
     value,
@@ -158,6 +163,8 @@ export default function Home() {
     const [renameOpen, setRenameOpen] = useState(false);
     const [nameDraft, setNameDraft] = useState('');
     const [confirmQuit, setConfirmQuit] = useState(false);
+    const [soloDeadline, setSoloDeadline] = useState(null);
+    const [timeLeft, setTimeLeft] = useState(null);
 
     const showToast = useCallback((message) => {
         setToast(message);
@@ -315,6 +322,44 @@ export default function Home() {
         return () => window.clearTimeout(syncControlState);
     }, [activePlayer, gameState.isFiring]);
 
+    // Solo mode keeps its own 30s clock per turn; multiplayer trusts the
+    // server's turn_started_at (the module auto-fires on timeout).
+    useEffect(() => {
+        if (mode !== 'single' || screen !== 'game' || gameState.isFiring || gameState.winner || gameState.players.length === 0) {
+            setSoloDeadline(null);
+            return;
+        }
+        setSoloDeadline(Date.now() + TURN_SECONDS * 1000);
+    }, [mode, screen, gameState.currentPlayerIndex, gameState.isFiring, gameState.winner, gameState.players.length]);
+
+    const turnDeadline = mode === 'multi'
+        ? (roomState?.status === 'playing' && roomState.turnStartedAt
+            ? roomState.turnStartedAt + (roomState.turnDurationMs ?? TURN_SECONDS * 1000)
+            : null)
+        : soloDeadline;
+
+    useEffect(() => {
+        if (!turnDeadline || gameState.isFiring || gameState.winner) {
+            setTimeLeft(null);
+            return;
+        }
+        const update = () => {
+            const remaining = Math.ceil((turnDeadline - Date.now()) / 1000);
+            setTimeLeft(Math.min(TURN_SECONDS, Math.max(0, remaining)));
+        };
+        update();
+        const id = window.setInterval(update, 200);
+        return () => window.clearInterval(id);
+    }, [turnDeadline, gameState.isFiring, gameState.winner]);
+
+    // Solo auto-shoot when the clock hits zero, using the current aim + weapon.
+    useEffect(() => {
+        if (mode !== 'single' || timeLeft !== 0 || !soloDeadline) return;
+        if (gameState.isFiring || gameState.winner) return;
+        setSoloDeadline(null);
+        engineRef.current?.fire(weapon);
+    }, [mode, timeLeft, soloDeadline, gameState.isFiring, gameState.winner, weapon]);
+
     const createGame = async () => {
         setLoading(true);
         try {
@@ -419,6 +464,13 @@ export default function Home() {
         setPower(val);
         engineRef.current?.updatePower(val);
         if (mode === 'multi') connectionRef.current?.aim(angle, val);
+    };
+
+    const handleWeaponSelect = (weaponId) => {
+        if (controlsDisabled) return;
+        setWeapon(weaponId);
+        // Sync the pick so a server-side turn timeout auto-fires this weapon.
+        if (mode === 'multi') connectionRef.current?.selectWeapon(weaponId);
     };
 
     const handleFire = () => {
@@ -668,10 +720,19 @@ export default function Home() {
                         )}
 
                         {!gameState.winner && !gameState.isFiring && gameState.players.length > 0 && (
-                            <div className="absolute top-20 left-1/2 -translate-x-1/2 flex flex-col items-center pointer-events-none z-10 hidden sm:flex">
-                                <div className={cn("text-[10px] font-bold uppercase tracking-[0.3em]", isMyTurn ? currentTheme.text : "text-slate-500")}>
+                            <div className="absolute top-20 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1.5 pointer-events-none z-10">
+                                <div className={cn("text-[10px] font-bold uppercase tracking-[0.3em] hidden sm:block", isMyTurn ? currentTheme.text : "text-slate-500")}>
                                     {mode === 'multi' ? (isMyTurn ? 'Your Turn' : `${opponent?.name ?? 'Opponent'} Aiming`) : `Turn: ${activePlayer?.name}`}
                                 </div>
+                                {timeLeft !== null && (
+                                    <div className={cn(
+                                        "flex items-center gap-1.5 rounded-full border px-3 py-1 font-mono text-sm font-black tabular-nums",
+                                        timeLeft <= 10 ? "border-rose-500/60 bg-rose-950/70 text-rose-300 animate-pulse" : "border-slate-700 bg-[#101522]/80 text-slate-200"
+                                    )}>
+                                        <Timer className="w-3.5 h-3.5" />
+                                        <span>{timeLeft}s</span>
+                                    </div>
+                                )}
                             </div>
                         )}
 
@@ -737,7 +798,7 @@ export default function Home() {
                                         <button
                                             key={w.id}
                                             disabled={controlsDisabled}
-                                            onClick={() => setWeapon(w.id)}
+                                            onClick={() => handleWeaponSelect(w.id)}
                                             className={cn(
                                                 "min-w-[90px] h-24 sm:h-28 bg-[#1A1D29] rounded-lg flex flex-col items-center justify-center gap-2 transition-all shrink-0",
                                                 isActive ? `border-2 ${currentTheme.border} ring-4 ${currentTheme.ring}` : "border border-slate-700 hover:border-slate-500 grayscale opacity-40 hover:grayscale-0 hover:opacity-100",

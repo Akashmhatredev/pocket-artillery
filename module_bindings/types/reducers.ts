@@ -11,10 +11,12 @@ import FireWeaponReducer from "../fire_weapon_reducer";
 import JoinMatchReducer from "../join_match_reducer";
 import LeaveMatchReducer from "../leave_match_reducer";
 import RenamePlayerReducer from "../rename_player_reducer";
+import SelectWeaponReducer from "../select_weapon_reducer";
 
 export type AimParams = __Infer<typeof AimReducer>;
 export type FireWeaponParams = __Infer<typeof FireWeaponReducer>;
 export type JoinMatchParams = __Infer<typeof JoinMatchReducer>;
 export type LeaveMatchParams = __Infer<typeof LeaveMatchReducer>;
 export type RenamePlayerParams = __Infer<typeof RenamePlayerReducer>;
+export type SelectWeaponParams = __Infer<typeof SelectWeaponReducer>;
 

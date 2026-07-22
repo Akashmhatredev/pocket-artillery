@@ -39,6 +39,7 @@ import FireWeaponReducer from "./fire_weapon_reducer";
 import JoinMatchReducer from "./join_match_reducer";
 import LeaveMatchReducer from "./leave_match_reducer";
 import RenamePlayerReducer from "./rename_player_reducer";
+import SelectWeaponReducer from "./select_weapon_reducer";
 
 // Import all procedure arg schemas
 
@@ -93,6 +94,7 @@ const reducersSchema = __reducers(
   __reducerSchema("join_match", JoinMatchReducer),
   __reducerSchema("leave_match", LeaveMatchReducer),
   __reducerSchema("rename_player", RenamePlayerReducer),
+  __reducerSchema("select_weapon", SelectWeaponReducer),
 );
 
 /** The schema information for all procedures in this module. This is defined the same way as the procedures would have been defined in the server. */
