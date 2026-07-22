@@ -207,10 +207,11 @@ export default function Home() {
 
     const handleServerEvent = useCallback((event) => {
         if (event.type === 'AIM_UPDATE') {
-            // Hot path: move the canvas barrel directly; only mirror the
-            // sliders for the opponent's aim (our own echo would fight the drag).
-            engineRef.current?.applyAimUpdate(event);
+            // Hot path — opponent aim only. Our own aim was already applied
+            // locally at input time; feeding the stale echo back into the
+            // engine would rubber-band the barrel mid-drag.
             if (event.playerId && event.playerId !== myPlayerIdRef.current) {
+                engineRef.current?.applyAimUpdate(event);
                 setAngle(event.angle);
                 setPower(event.power);
             }
@@ -250,7 +251,7 @@ export default function Home() {
         }
 
         if (event.type === 'SERVER_PROJECTILE_SPAWNED' || event.type === 'PROJECTILE_SPAWNED') {
-            engineRef.current?.spawnNetworkProjectile(event);
+            engineRef.current?.spawnNetworkProjectile(event, event.playerId === myPlayerIdRef.current);
             return;
         }
 
@@ -267,6 +268,11 @@ export default function Home() {
         }
 
         if (event.type === 'ERROR') {
+            // A rejected action (e.g. the turn timer fired first) means the
+            // optimistic preview shot never happened — take it back down.
+            if (event.code === 'REDUCER_FAILED') {
+                engineRef.current?.cancelOptimisticProjectile();
+            }
             showToast(event.message);
         }
     }, [showToast, syncRoomToEngine]);
@@ -518,6 +524,12 @@ export default function Home() {
     const handleFire = () => {
         if (controlsDisabled) return;
         if (mode === 'multi') {
+            // Show the shot immediately instead of waiting a server round-trip;
+            // the authoritative spawn event adopts it (or an error removes it).
+            const ammoLeft = myPlayer?.ammo?.[weapon];
+            if (ammoLeft === undefined || ammoLeft > 0) {
+                engineRef.current?.spawnOptimisticProjectile(weapon, angle, power);
+            }
             connectionRef.current?.fire(angle, power, weapon);
         } else {
             engineRef.current?.fire(weapon);
