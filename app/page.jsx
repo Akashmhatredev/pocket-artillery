@@ -55,6 +55,10 @@ const DEFAULT_PLAYER_NAME = 'Commander';
 // automatically. Must match TURN_MS in stdb-module/src/lib.rs.
 const TURN_SECONDS = 30;
 
+// Minimum gap between outbound aim syncs. Slider drags fire ~60 events/s;
+// sending each one floods the websocket and lags everything behind it.
+const AIM_SYNC_MS = 100;
+
 const GameSlider = ({
     value,
     onValueChange,
@@ -146,6 +150,8 @@ export default function Home() {
     const requestRef = useRef(0);
     const connectionRef = useRef(null);
     const playerNameRef = useRef(DEFAULT_PLAYER_NAME);
+    const myPlayerIdRef = useRef(null);
+    const aimSyncRef = useRef({ last: 0, timer: null, angle: null, power: null });
 
     const [screen, setScreen] = useState('home');
     const [mode, setMode] = useState('single');
@@ -184,7 +190,33 @@ export default function Home() {
         }
     }, []);
 
+    // Trailing-edge throttle: always ends up sending the latest aim, but at
+    // most one reducer call per AIM_SYNC_MS.
+    const sendAimThrottled = useCallback((nextAngle, nextPower) => {
+        const sync = aimSyncRef.current;
+        sync.angle = nextAngle;
+        sync.power = nextPower;
+        if (sync.timer !== null) return;
+        const wait = Math.max(0, AIM_SYNC_MS - (Date.now() - sync.last));
+        sync.timer = window.setTimeout(() => {
+            sync.timer = null;
+            sync.last = Date.now();
+            connectionRef.current?.aim(sync.angle, sync.power);
+        }, wait);
+    }, []);
+
     const handleServerEvent = useCallback((event) => {
+        if (event.type === 'AIM_UPDATE') {
+            // Hot path: move the canvas barrel directly; only mirror the
+            // sliders for the opponent's aim (our own echo would fight the drag).
+            engineRef.current?.applyAimUpdate(event);
+            if (event.playerId && event.playerId !== myPlayerIdRef.current) {
+                setAngle(event.angle);
+                setPower(event.power);
+            }
+            return;
+        }
+
         if (event.type === 'JOINED') {
             setSession((current) => {
                 if (!current) return current;
@@ -282,6 +314,9 @@ export default function Home() {
         return () => {
             cancelAnimationFrame(requestRef.current);
             connectionRef.current?.disconnect();
+            if (aimSyncRef.current.timer !== null) {
+                window.clearTimeout(aimSyncRef.current.timer);
+            }
         };
     }, []);
 
@@ -296,6 +331,10 @@ export default function Home() {
     useEffect(() => {
         playerNameRef.current = playerName;
     }, [playerName]);
+
+    useEffect(() => {
+        myPlayerIdRef.current = session?.playerId ?? null;
+    }, [session]);
 
     useEffect(() => {
         const storedSession = getStoredSession();
@@ -313,6 +352,8 @@ export default function Home() {
     const opponent = roomState?.players.find((player) => player.id !== session?.playerId);
     const roomUrl = typeof window === 'undefined' || !session ? '' : `${window.location.origin}?room=${session.roomCode}`;
 
+    // Re-seed the sliders from server state only when the turn changes —
+    // running this on every state sync would fight an in-progress drag.
     useEffect(() => {
         if (!activePlayer || gameState.isFiring) return;
         const syncControlState = window.setTimeout(() => {
@@ -320,7 +361,8 @@ export default function Home() {
             setPower(activePlayer.power);
         }, 0);
         return () => window.clearTimeout(syncControlState);
-    }, [activePlayer, gameState.isFiring]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [gameState.currentPlayerIndex, gameState.isFiring, mode, screen]);
 
     // Solo mode keeps its own 30s clock per turn; multiplayer trusts the
     // server's turn_started_at (the module auto-fires on timeout).
@@ -456,14 +498,14 @@ export default function Home() {
         if (controlsDisabled) return;
         setAngle(val);
         engineRef.current?.updateAngle(val);
-        if (mode === 'multi') connectionRef.current?.aim(val, power);
+        if (mode === 'multi') sendAimThrottled(val, power);
     };
 
     const handlePowerChange = (val) => {
         if (controlsDisabled) return;
         setPower(val);
         engineRef.current?.updatePower(val);
-        if (mode === 'multi') connectionRef.current?.aim(angle, val);
+        if (mode === 'multi') sendAimThrottled(angle, val);
     };
 
     const handleWeaponSelect = (weaponId) => {
