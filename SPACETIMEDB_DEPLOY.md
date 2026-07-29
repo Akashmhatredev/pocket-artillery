@@ -28,10 +28,19 @@ SpacetimeDB over a WebSocket and subscribes to those tables.
 
 | Path | What it is |
 | :--- | :--------- |
-| `stdb-module/` | The Rust SpacetimeDB module (server logic + schema). |
+| `stdb-module/src/lib.rs` | Tables, reducers, scheduling, turn orchestration. |
+| `stdb-module/src/sim.rs` | Pure ballistics / terrain / blast math (no `spacetimedb` imports). |
+| `stdb-module/src/robot.rs` | Pure robot-opponent decision making (no `spacetimedb` imports). |
+| `stdb-module/tests-core/` | Standalone crate that pulls the two pure files in by path so `cargo test` can run them natively. Never part of the published module. |
 | `module_bindings/` | **Generated** TypeScript client bindings. Committed so Vercel can build without the CLI. Regenerate whenever the module changes. |
 | `lib/multiplayer/spacetime.js` | Browser-side connection adapter (subscribes to tables, calls reducers). |
+| `lib/game/feed.js` | Turns the adapter's event stream into battle-log lines and the scoreboard. |
 | `app/page.jsx` | Game UI. Talks only to the adapter. |
+| `tests/integration/` | Headless clients that drive a real local instance over a websocket. |
+
+> The module compiles to `wasm32-unknown-unknown` and links against the
+> SpacetimeDB host ABI, so `cargo test` cannot build it natively — that's why the
+> pure logic lives in its own files and is tested through `tests-core/`.
 
 ---
 
@@ -181,18 +190,33 @@ bindings committed to bridge the two.
 ## 5. The ongoing loop (when you change game logic)
 
 ```bash
-# 1. edit stdb-module/src/lib.rs
-# 2. republish to Maincloud
+# 1. edit stdb-module/src/{lib,sim,robot}.rs
+# 2. run the offline tests (physics + robot AI + client helpers)
+npm test
+# 3. republish to Maincloud
 spacetime publish -p stdb-module --server maincloud pocket-artillery
-# 3. regenerate + commit bindings
+# 4. regenerate + commit bindings
 npm run stdb:generate && git add -A && git commit -m "feat: <change>"
-# 4. push → Vercel auto-deploys the frontend
+# 5. push → Vercel auto-deploys the frontend
 git push
 ```
 
 If a schema change is breaking, `spacetime publish` will warn you and may
 require `--delete-data` (wipes the database) or a migration. For a game with no
 long-lived data to preserve, `--delete-data` is usually fine in development.
+
+> The robot-opponent release added columns (`match_room.solo`,
+> `match_room.last_activity`, `player.is_robot`, `player.robot_difficulty`,
+> `player.shots_fired`) and new scheduled tables, so upgrading past it needs
+> `--delete-data`. All match state is ephemeral, so nothing of value is lost.
+
+To exercise the whole thing end to end against a local instance before shipping:
+
+```bash
+spacetime start                                                    # terminal 1
+spacetime publish -s local -p stdb-module pocket-artillery --delete-data
+npm run test:integration                                           # terminal 2
+```
 
 ---
 

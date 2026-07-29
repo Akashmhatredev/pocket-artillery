@@ -10,7 +10,14 @@
     "clean": "next clean",
     "stdb:generate": "spacetime generate --lang typescript --out-dir module_bindings --module-path stdb-module",
     "stdb:publish": "spacetime publish -p stdb-module pocket-artillery",
-    "stdb:start": "spacetime start"
+    "stdb:start": "spacetime start",
+    "test": "npm run test:module && npm run test:unit",
+    "test:module": "cd stdb-module/tests-core && cargo test",
+    "test:unit": "node --test \"tests/unit/*.test.mjs\"",
+    "test:integration": "npm run test:integration:solo && npm run test:integration:multi && npm run test:integration:client",
+    "test:integration:solo": "tsx --tsconfig tests/integration/tsconfig.json tests/integration/solo-flow.ts",
+    "test:integration:multi": "tsx --tsconfig tests/integration/tsconfig.json tests/integration/multiplayer-regression.ts",
+    "test:integration:client": "tsx --tsconfig tests/integration/tsconfig.json tests/integration/client-events.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

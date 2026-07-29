@@ -35,6 +35,7 @@ import {
 
 // Import all reducer arg schemas
 import AimReducer from "./aim_reducer";
+import CreateSoloMatchReducer from "./create_solo_match_reducer";
 import FireWeaponReducer from "./fire_weapon_reducer";
 import JoinMatchReducer from "./join_match_reducer";
 import LeaveMatchReducer from "./leave_match_reducer";
@@ -90,6 +91,7 @@ const tablesSchema = __schema({
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
   __reducerSchema("aim", AimReducer),
+  __reducerSchema("create_solo_match", CreateSoloMatchReducer),
   __reducerSchema("fire_weapon", FireWeaponReducer),
   __reducerSchema("join_match", JoinMatchReducer),
   __reducerSchema("leave_match", LeaveMatchReducer),

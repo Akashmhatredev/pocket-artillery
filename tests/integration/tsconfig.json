@@ -1,0 +1,13 @@
+{
+  "//": "Lets the integration tests resolve the app's `@/...` imports (the app itself uses jsconfig.json, which tsx does not read).",
+  "compilerOptions": {
+    "baseUrl": "../..",
+    "paths": {
+      "@/*": ["./*"]
+    },
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "es2022",
+    "allowJs": true
+  }
+}

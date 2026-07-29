@@ -3,27 +3,68 @@
 //! This single module replaces BOTH the old PartyKit realtime server AND the
 //! Supabase persistence layer. Game state lives in SpacetimeDB tables; clients
 //! subscribe to them and react to row changes. All authoritative logic
-//! (turns, physics, damage, terrain destruction) runs here as reducers.
+//! (turns, physics, damage, terrain destruction, the robot opponent) runs here
+//! as reducers.
 //!
 //! Ported from backend/src/handlers/{MatchHandler,PhysicsEngine}.js.
+//!
+//! Layout:
+//! * [`sim`]   — pure ballistics/terrain/damage math (host-testable).
+//! * [`robot`] — the AI opponent's pure decision making (host-testable).
+//! * this file — tables, reducers, scheduling, and turn orchestration.
+//!
+//! The robot is a real seated `Player` row driven by scheduled reducers. It has
+//! no bypass: its shots go through the same `launch_shot` that a human's
+//! `fire_weapon` call does, so ammo, turn order, and physics all apply equally.
 
-use core::f32::consts::PI;
-use spacetimedb::{reducer, table, Identity, ReducerContext, ScheduleAt, Table, Timestamp};
+mod robot;
+mod sim;
+
+use robot::Difficulty;
+use sim::Tank;
+use spacetimedb::{
+    reducer, table, Identity, ReducerContext, ScheduleAt, Table, TimeDuration, Timestamp,
+};
 
 // ---------------------------------------------------------------------------
-// World constants (mirrors WORLD in PhysicsEngine.js)
+// Tuning constants
 // ---------------------------------------------------------------------------
 
-const WIDTH: usize = 1200;
-const HEIGHT: usize = 800;
-const GRAVITY: f32 = 0.2;
-const MAX_TICKS: u64 = 1800;
-const TICK_MS: u64 = 16;
 const RECONNECT_GRACE_MS: i64 = 60_000;
 const TURN_MS: i64 = 30_000;
 
+/// How long the robot "thinks" before its aim appears, and how long it holds
+/// that aim before firing. Purely cosmetic pacing so a human can watch the
+/// barrel swing instead of being hit by an instantaneous shot.
+const ROBOT_THINK_MS: i64 = 800;
+const ROBOT_AIM_MS: i64 = 900;
+
+/// How often abandoned rooms are swept, and how long a room may sit untouched
+/// before it counts as abandoned. A live match bumps its activity stamp every
+/// turn (at most 30s apart), so nothing playable is ever close to the cutoff.
+const CLEANUP_INTERVAL_MS: i64 = 300_000;
+const ROOM_IDLE_MS: i64 = 900_000;
+
+const STARTING_HP: i32 = 100;
+const AMMO_STANDARD: u32 = 99;
+const AMMO_CLUSTER: u32 = 3;
+const AMMO_NUKE: u32 = 1;
+
 const PLAYER_COLORS: [&str; 2] = ["#22d3ee", "#fb7185"];
 const PLAYER_NAMES: [&str; 2] = ["Alpha", "Omega"];
+const ROBOT_COLOR: &str = "#a78bfa";
+
+/// Marks the synthetic identities minted for robots. Real identities come from
+/// JWT hashes, so this prefix will never collide with a human's.
+const ROBOT_ID_TAG: [u8; 8] = [0xB0, 0x11, 0x0B, 0x07, 0xA1, 0xFF, 0x5E, 0xED];
+
+const STATUS_WAITING: &str = "waiting";
+const STATUS_PLAYING: &str = "playing";
+const STATUS_PAUSED: &str = "paused";
+const STATUS_FINISHED: &str = "finished";
+
+const PHASE_AIM: u8 = 0;
+const PHASE_FIRE: u8 = 1;
 
 // ---------------------------------------------------------------------------
 // Tables
@@ -51,10 +92,18 @@ pub struct MatchRoom {
     pub turn_id: u64,
     /// Full terrain heightmap, one entry per horizontal pixel (length == WIDTH).
     pub terrain: Vec<f32>,
+    /// True for a single-human match against a robot. Solo rooms are private:
+    /// nobody else can join them.
+    pub solo: bool,
+    /// Last time anything meaningful happened here; drives stale-room cleanup.
+    /// Only bumped by writes that already touch this row, so it never causes an
+    /// extra client-visible update.
+    pub last_activity: Timestamp,
 }
 
 /// One row per player. Keyed by the caller's SpacetimeDB Identity, so an
-/// identity can be in at most one match at a time.
+/// identity can be in at most one match at a time. Robots get a synthetic
+/// identity derived from the room code (see [`robot_identity_for`]).
 #[table(name = player, public)]
 #[derive(Clone)]
 pub struct Player {
@@ -74,10 +123,18 @@ pub struct Player {
     pub ammo_cluster: u32,
     pub ammo_nuke: u32,
     /// Currently selected weapon ("standard" | "cluster" | "nuke"); used when
-    /// the turn clock expires and the server auto-fires on the player's behalf.
+    /// the turn clock expires and the server auto-fires on the player's behalf,
+    /// and to carry the robot's choice from its aim phase to its fire phase.
     pub selected_weapon: String,
     /// Browser-scoped id (survives identity churn across tabs); informational.
     pub client_id: String,
+    /// True for AI-controlled players. Drives the "AI" badge in the UI and the
+    /// scheduled turn handoff in [`begin_turn`].
+    pub is_robot: bool,
+    /// "easy" | "normal" | "hard" for robots; empty for humans.
+    pub robot_difficulty: String,
+    /// Shots taken this match, for the end-of-match summary.
+    pub shots_fired: u32,
 }
 
 /// An in-flight projectile. Inserted on fire (clients animate it), deleted at
@@ -135,12 +192,44 @@ pub struct TurnTimer {
     pub turn_id: u64,
 }
 
+/// Scheduled one-shot: drives one step of a robot's turn. `phase` is
+/// PHASE_AIM (commit an aim) or PHASE_FIRE (pull the trigger). Carries the
+/// turn_id it was armed for so stale timers are ignored.
+#[table(name = robot_timer, scheduled(process_robot_turn))]
+pub struct RobotTimer {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+    pub room_code: String,
+    pub turn_id: u64,
+    pub phase: u8,
+}
+
+/// Scheduled repeating: sweeps abandoned rooms and orphaned rows.
+#[table(name = cleanup_timer, scheduled(process_room_cleanup))]
+pub struct CleanupTimer {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle reducers
 // ---------------------------------------------------------------------------
 
 #[reducer(init)]
-pub fn init(_ctx: &ReducerContext) {
+pub fn init(ctx: &ReducerContext) {
+    // Guarded so a republish that keeps existing data doesn't stack up sweepers.
+    if ctx.db.cleanup_timer().count() == 0 {
+        ctx.db.cleanup_timer().insert(CleanupTimer {
+            scheduled_id: 0,
+            scheduled_at: ScheduleAt::Interval(TimeDuration::from_micros(
+                CLEANUP_INTERVAL_MS * 1000,
+            )),
+        });
+    }
     log::info!("pocket-artillery module initialized");
 }
 
@@ -167,10 +256,11 @@ pub fn client_disconnected(ctx: &ReducerContext) {
     ctx.db.player().identity().update(p);
 
     if let Some(mut room) = ctx.db.match_room().room_code().find(&code) {
-        if room.status == "playing" {
+        if room.status == STATUS_PLAYING {
             let deadline = plus_millis(ctx.timestamp, RECONNECT_GRACE_MS);
-            room.status = "paused".to_string();
+            room.status = STATUS_PAUSED.to_string();
             room.disconnect_deadline = Some(deadline);
+            room.last_activity = ctx.timestamp;
             ctx.db.match_room().room_code().update(room);
             ctx.db.forfeit_timer().insert(ForfeitTimer {
                 scheduled_id: 0,
@@ -186,8 +276,8 @@ pub fn client_disconnected(ctx: &ReducerContext) {
 // Gameplay reducers (called by clients)
 // ---------------------------------------------------------------------------
 
-/// Join (or create) a room. Creates the match on first join, seats the caller,
-/// and starts the match once two players are seated.
+/// Join (or create) a multiplayer room. Creates the match on first join, seats
+/// the caller, and starts the match once two players are seated.
 #[reducer]
 pub fn join_match(
     ctx: &ReducerContext,
@@ -200,69 +290,50 @@ pub fn join_match(
         return Err("Invalid room code.".to_string());
     }
 
-    // Ensure the room exists.
-    let mut room = match ctx.db.match_room().room_code().find(&code) {
-        Some(r) => r,
-        None => {
-            let seed = seed_from(ctx.timestamp);
-            ctx.db.match_room().insert(MatchRoom {
-                room_code: code.clone(),
-                status: "waiting".to_string(),
-                active_player_slot: 0,
-                terrain_seed: seed,
-                wind: 0.0,
-                width: WIDTH as u32,
-                height: HEIGHT as u32,
-                winner_identity: None,
-                turn_started_at: None,
-                disconnect_deadline: None,
-                turn_id: 0,
-                terrain: Vec::new(),
-            })
-        }
-    };
-
-    // Seat the caller (reconnect, room switch, or brand-new seat).
-    match ctx.db.player().identity().find(ctx.sender) {
-        Some(mut p) if p.room_code == code => {
-            p.connected = true;
-            if let Some(n) = safe_name(&name) {
-                p.name = n;
-            }
-            p.client_id = client_id;
-            ctx.db.player().identity().update(p);
-        }
-        Some(_) => {
-            // Player is in a different room — leave it, then take a new seat.
-            ctx.db.player().identity().delete(ctx.sender);
-            seat_new_player(ctx, &code, &name, &client_id)?;
-        }
-        None => {
-            seat_new_player(ctx, &code, &name, &client_id)?;
+    // A solo room belongs to its creator and their robot; strangers stay out.
+    // (The creator's own reconnect is allowed — they are already seated.)
+    if let Some(existing) = ctx.db.match_room().room_code().find(&code) {
+        let already_seated = ctx
+            .db
+            .player()
+            .identity()
+            .find(ctx.sender)
+            .is_some_and(|p| p.room_code == code);
+        if existing.solo && !already_seated {
+            return Err("That room is a solo match against the robot.".to_string());
         }
     }
 
-    let seated: Vec<Player> = players_in(ctx, &code);
-    let connected = seated.iter().filter(|p| p.connected).count();
+    ensure_room(ctx, &code, false);
+    seat_caller(ctx, &code, &name, &client_id)?;
+    settle_lobby(ctx, &code)
+}
 
-    // Resume a paused match once both players are back.
-    if room.status == "paused" && connected >= 2 {
-        room.status = "playing".to_string();
-        room.disconnect_deadline = None;
-        // Restart the active player's turn clock — unless a shot is mid-air,
-        // in which case its impact will begin the next turn.
-        if !projectile_in_flight(ctx, &code) {
-            begin_turn(ctx, &mut room);
+/// Start (or rejoin) a solo match: seats the caller, seats a robot opposite
+/// them, and kicks the match off immediately — no second human required.
+#[reducer]
+pub fn create_solo_match(
+    ctx: &ReducerContext,
+    room_code: String,
+    name: String,
+    client_id: String,
+    difficulty: String,
+) -> Result<(), String> {
+    let code = normalize_code(&room_code);
+    if code.len() < 4 {
+        return Err("Invalid room code.".to_string());
+    }
+    if let Some(existing) = ctx.db.match_room().room_code().find(&code) {
+        if !existing.solo {
+            return Err("That room is already a multiplayer match.".to_string());
         }
-        ctx.db.match_room().room_code().update(room.clone());
     }
 
-    // Kick off a fresh match once two players are seated and present.
-    if room.status == "waiting" && seated.len() == 2 && connected == 2 {
-        start_match(ctx, &code)?;
-    }
-
-    Ok(())
+    let level = Difficulty::from_label(&difficulty);
+    ensure_room(ctx, &code, true);
+    seat_caller(ctx, &code, &name, &client_id)?;
+    ensure_robot(ctx, &code, level)?;
+    settle_lobby(ctx, &code)
 }
 
 /// Update the caller's aim. Only meaningful while the match is playing.
@@ -280,11 +351,11 @@ pub fn aim(ctx: &ReducerContext, angle: f32, power: f32) -> Result<(), String> {
         .room_code()
         .find(&player.room_code)
         .ok_or("Room no longer exists.")?;
-    if room.status != "playing" {
+    if room.status != STATUS_PLAYING {
         return Ok(());
     }
-    player.angle = clamp(angle, 0.0, 180.0);
-    player.power = clamp(power, 1.0, 100.0);
+    player.angle = sim::clamp(angle, 0.0, 180.0);
+    player.power = sim::clamp(power, 1.0, 100.0);
     ctx.db.player().identity().update(player);
     Ok(())
 }
@@ -311,17 +382,27 @@ pub fn fire_weapon(
         .find(&player.room_code)
         .ok_or("Room no longer exists.")?;
 
-    if room.status != "playing" {
+    if room.status != STATUS_PLAYING {
         return Err("Cannot fire until the match is active.".to_string());
     }
     if room.active_player_slot != player.slot {
         return Err("Only the active player can fire.".to_string());
     }
+    if player.hp <= 0 {
+        return Err("Your tank is destroyed.".to_string());
+    }
     if projectile_in_flight(ctx, &player.room_code) {
         return Err("A shot is already in flight.".to_string());
     }
 
-    launch_shot(ctx, player, &room, angle, power, normalize_weapon(&weapon_id))
+    launch_shot(
+        ctx,
+        player,
+        &room,
+        angle,
+        power,
+        sim::normalize_weapon(&weapon_id),
+    )
 }
 
 /// Remember the caller's weapon choice so a turn timeout fires the right one.
@@ -333,7 +414,11 @@ pub fn select_weapon(ctx: &ReducerContext, weapon_id: String) -> Result<(), Stri
         .identity()
         .find(ctx.sender)
         .ok_or("Join a room before selecting a weapon.")?;
-    player.selected_weapon = normalize_weapon(&weapon_id).to_string();
+    let next = sim::normalize_weapon(&weapon_id);
+    if player.selected_weapon == next {
+        return Ok(());
+    }
+    player.selected_weapon = next.to_string();
     ctx.db.player().identity().update(player);
     Ok(())
 }
@@ -343,22 +428,28 @@ pub fn select_weapon(ctx: &ReducerContext, weapon_id: String) -> Result<(), Stri
 pub fn rename_player(ctx: &ReducerContext, name: String) -> Result<(), String> {
     if let Some(mut p) = ctx.db.player().identity().find(ctx.sender) {
         if let Some(n) = safe_name(&name) {
-            p.name = n;
-            ctx.db.player().identity().update(p);
+            if n != p.name {
+                p.name = n;
+                ctx.db.player().identity().update(p);
+            }
         }
     }
     Ok(())
 }
 
-/// Explicitly leave the current room. Cleans up an empty room.
+/// Explicitly leave the current room. Cleans up rooms nobody is left playing.
 #[reducer]
 pub fn leave_match(ctx: &ReducerContext) -> Result<(), String> {
-    if let Some(p) = ctx.db.player().identity().find(ctx.sender) {
-        let code = p.room_code.clone();
-        ctx.db.player().identity().delete(ctx.sender);
-        if players_in(ctx, &code).is_empty() {
-            ctx.db.match_room().room_code().delete(&code);
-        }
+    let Some(p) = ctx.db.player().identity().find(ctx.sender) else {
+        return Ok(());
+    };
+    let code = p.room_code.clone();
+    ctx.db.player().identity().delete(ctx.sender);
+
+    // A room holding nothing but robots has no one left to play it.
+    let remaining = players_in(ctx, &code);
+    if remaining.iter().all(|r| r.is_robot) {
+        demolish_room(ctx, &code);
     }
     Ok(())
 }
@@ -370,10 +461,7 @@ pub fn leave_match(ctx: &ReducerContext) -> Result<(), String> {
 /// Resolve an explosion once the projectile's time-to-impact elapses.
 #[reducer]
 pub fn process_impact(ctx: &ReducerContext, timer: ImpactTimer) -> Result<(), String> {
-    // Only the scheduler (module identity) may invoke scheduled reducers.
-    if ctx.sender != ctx.identity() {
-        return Err("Scheduled reducers cannot be called by clients.".to_string());
-    }
+    scheduler_only(ctx)?;
 
     let Some(proj) = ctx.db.projectile().id().find(timer.projectile_id) else {
         return Ok(());
@@ -383,35 +471,20 @@ pub fn process_impact(ctx: &ReducerContext, timer: ImpactTimer) -> Result<(), St
         return Ok(());
     };
 
-    let w = weapon(&proj.weapon_id);
+    let w = sim::weapon(&proj.weapon_id);
     let (cx, cy) = (proj.impact_x, proj.impact_y);
 
-    // Carve the terrain (raise heights inside the blast circle).
+    // Carve the terrain, then apply damage and reseat players onto the new
+    // heightmap.
     let mut terrain = room.terrain.clone();
-    if !terrain.is_empty() {
-        let from_x = (cx - w.explosion_radius).floor().max(0.0) as usize;
-        let to_x = (cx + w.explosion_radius)
-            .floor()
-            .min((WIDTH - 1) as f32)
-            .max(0.0) as usize;
-        for (x, cell) in terrain.iter_mut().enumerate().take(to_x + 1).skip(from_x) {
-            let dx = x as f32 - cx;
-            let dy = (w.explosion_radius * w.explosion_radius - dx * dx).max(0.0).sqrt();
-            if *cell < cy + dy {
-                *cell = round2((cy + dy).min(HEIGHT as f32));
-            }
-        }
-    }
+    sim::carve_terrain(&mut terrain, cx, cy, w.explosion_radius);
 
-    // Apply damage and reseat players onto the modified terrain.
     for mut p in players_in(ctx, &proj.room_code) {
-        let dist = ((p.x - cx).powi(2) + ((p.y - 8.0) - cy).powi(2)).sqrt();
-        if dist < w.explosion_radius + 15.0 {
-            let falloff = (1.0 - dist / (w.explosion_radius + 15.0)).max(0.1);
-            let applied = (w.damage * falloff).floor() as i32;
-            p.hp = (p.hp - applied).max(0);
+        let hit = sim::blast_damage(&w, &tank_of(&p), cx, cy);
+        if hit > 0 {
+            p.hp = (p.hp - hit).max(0);
         }
-        p.y = get_terrain_height(&terrain, p.x);
+        p.y = sim::get_terrain_height(&terrain, p.x);
         ctx.db.player().identity().update(p);
     }
 
@@ -420,12 +493,10 @@ pub fn process_impact(ctx: &ReducerContext, timer: ImpactTimer) -> Result<(), St
     let alive: Vec<&Player> = players.iter().filter(|p| p.hp > 0).collect();
     room.terrain = terrain;
     if alive.len() <= 1 {
-        room.status = "finished".to_string();
-        room.winner_identity = alive.first().map(|p| p.identity);
-        room.turn_started_at = None;
+        let winner = alive.first().map(|p| p.identity);
+        finish_match(ctx, &mut room, winner);
     } else {
-        room.active_player_slot = next_living_slot(room.active_player_slot, &players);
-        begin_turn(ctx, &mut room);
+        advance_turn(ctx, &mut room);
     }
     ctx.db.match_room().room_code().update(room);
 
@@ -437,62 +508,100 @@ pub fn process_impact(ctx: &ReducerContext, timer: ImpactTimer) -> Result<(), St
 /// Auto-fire for the active player once the 30s turn clock expires.
 #[reducer]
 pub fn process_turn_timeout(ctx: &ReducerContext, timer: TurnTimer) -> Result<(), String> {
-    if ctx.sender != ctx.identity() {
-        return Err("Scheduled reducers cannot be called by clients.".to_string());
-    }
+    scheduler_only(ctx)?;
 
     let Some(mut room) = ctx.db.match_room().room_code().find(&timer.room_code) else {
         return Ok(());
     };
     // Stale timer: the turn already ended (shot resolved, pause, match over).
-    if room.status != "playing" || room.turn_id != timer.turn_id {
+    if room.status != STATUS_PLAYING || room.turn_id != timer.turn_id {
         return Ok(());
     }
     // The player fired at the buzzer; the in-flight shot will resolve the turn.
     if projectile_in_flight(ctx, &timer.room_code) {
         return Ok(());
     }
-    let Some(player) = players_in(ctx, &timer.room_code)
-        .into_iter()
-        .find(|p| p.slot == room.active_player_slot && p.hp > 0)
-    else {
+    let Some(player) = active_player(ctx, &room) else {
         return Ok(());
     };
 
     // Fire their current aim; fall back to standard if the pick is out of ammo.
-    let mut wid = normalize_weapon(&player.selected_weapon);
-    let ammo = match wid {
-        "cluster" => player.ammo_cluster,
-        "nuke" => player.ammo_nuke,
-        _ => player.ammo_standard,
-    };
-    if ammo == 0 {
-        wid = "standard";
+    let mut wid = sim::normalize_weapon(&player.selected_weapon);
+    if ammo_for(&player, wid) == 0 {
+        wid = sim::WEAPON_STANDARD;
     }
-    if wid == "standard" && player.ammo_standard == 0 {
+    if ammo_for(&player, wid) == 0 {
         // Nothing left to fire — pass the turn instead.
-        let players = players_in(ctx, &timer.room_code);
-        room.active_player_slot = next_living_slot(room.active_player_slot, &players);
-        begin_turn(ctx, &mut room);
+        log::info!(
+            "room={} slot={} timed out with no ammo; passing the turn",
+            timer.room_code,
+            player.slot
+        );
+        advance_turn(ctx, &mut room);
         ctx.db.match_room().room_code().update(room);
         return Ok(());
     }
 
+    log::info!(
+        "room={} slot={} turn expired; auto-firing {wid}",
+        timer.room_code,
+        player.slot
+    );
     let (angle, power) = (player.angle, player.power);
     launch_shot(ctx, player, &room, angle, power, wid)
+}
+
+/// Drive one step of a robot's turn: commit an aim, then fire it.
+///
+/// Split into two scheduled steps so the human sees the barrel move before the
+/// shot goes out. Both steps re-validate against the live room, so a stale
+/// timer (turn already over, match paused, human quit) is a no-op.
+#[reducer]
+pub fn process_robot_turn(ctx: &ReducerContext, timer: RobotTimer) -> Result<(), String> {
+    scheduler_only(ctx)?;
+
+    let Some(mut room) = ctx.db.match_room().room_code().find(&timer.room_code) else {
+        return Ok(());
+    };
+    if room.status != STATUS_PLAYING || room.turn_id != timer.turn_id {
+        return Ok(()); // stale: the turn moved on without us
+    }
+    if projectile_in_flight(ctx, &timer.room_code) {
+        return Ok(());
+    }
+    let Some(bot) = active_player(ctx, &room).filter(|p| p.is_robot) else {
+        return Ok(());
+    };
+
+    if timer.phase == PHASE_AIM {
+        return robot_take_aim(ctx, &mut room, bot);
+    }
+
+    // PHASE_FIRE: shoot the aim committed in the previous step. Reading it back
+    // off the row means the robot fires exactly what the client already saw.
+    let wid = sim::normalize_weapon(&bot.selected_weapon);
+    if ammo_for(&bot, wid) == 0 {
+        log::warn!(
+            "robot room={} lost its {wid} ammo mid-turn; passing",
+            timer.room_code
+        );
+        advance_turn(ctx, &mut room);
+        ctx.db.match_room().room_code().update(room);
+        return Ok(());
+    }
+    let (angle, power) = (bot.angle, bot.power);
+    launch_shot(ctx, bot, &room, angle, power, wid)
 }
 
 /// Award the match to the remaining player if their opponent never reconnects.
 #[reducer]
 pub fn process_forfeit(ctx: &ReducerContext, timer: ForfeitTimer) -> Result<(), String> {
-    if ctx.sender != ctx.identity() {
-        return Err("Scheduled reducers cannot be called by clients.".to_string());
-    }
+    scheduler_only(ctx)?;
 
     let Some(mut room) = ctx.db.match_room().room_code().find(&timer.room_code) else {
         return Ok(());
     };
-    if room.status != "paused" {
+    if room.status != STATUS_PAUSED {
         return Ok(());
     }
     let Some(dropped) = ctx.db.player().identity().find(timer.player_identity) else {
@@ -506,17 +615,245 @@ pub fn process_forfeit(ctx: &ReducerContext, timer: ForfeitTimer) -> Result<(), 
         .into_iter()
         .find(|p| p.identity != timer.player_identity && p.hp > 0);
 
-    room.status = "finished".to_string();
-    room.winner_identity = opponent.map(|p| p.identity);
-    room.turn_started_at = None;
-    room.disconnect_deadline = None;
+    log::info!(
+        "room={} forfeited by slot={} after the reconnect window",
+        timer.room_code,
+        dropped.slot
+    );
+    finish_match(ctx, &mut room, opponent.map(|p| p.identity));
     ctx.db.match_room().room_code().update(room);
     Ok(())
 }
 
+/// Sweep rooms nobody came back to, plus any rows orphaned behind them.
+///
+/// "Abandoned" needs both halves: gone quiet **and** nobody connected. A host
+/// can sit in a lobby for an hour waiting for a friend without the room being
+/// swept out from under them, and a robot (always flagged connected) never keeps
+/// a room alive on its own.
+#[reducer]
+pub fn process_room_cleanup(ctx: &ReducerContext, _timer: CleanupTimer) -> Result<(), String> {
+    scheduler_only(ctx)?;
+
+    let cutoff = ctx.timestamp.to_micros_since_unix_epoch() - ROOM_IDLE_MS * 1000;
+    let stale: Vec<String> = ctx
+        .db
+        .match_room()
+        .iter()
+        .filter(|r| r.last_activity.to_micros_since_unix_epoch() < cutoff)
+        .filter(|r| {
+            !players_in(ctx, &r.room_code)
+                .iter()
+                .any(|p| p.connected && !p.is_robot)
+        })
+        .map(|r| r.room_code.clone())
+        .collect();
+
+    for code in &stale {
+        log::info!("sweeping abandoned room={code}");
+        demolish_room(ctx, code);
+    }
+
+    // Rows whose room vanished some other way (crash, manual delete).
+    let orphan_players: Vec<Identity> = ctx
+        .db
+        .player()
+        .iter()
+        .filter(|p| ctx.db.match_room().room_code().find(&p.room_code).is_none())
+        .map(|p| p.identity)
+        .collect();
+    for identity in orphan_players {
+        ctx.db.player().identity().delete(identity);
+    }
+
+    let orphan_shots: Vec<u64> = ctx
+        .db
+        .projectile()
+        .iter()
+        .filter(|p| ctx.db.match_room().room_code().find(&p.room_code).is_none())
+        .map(|p| p.id)
+        .collect();
+    for id in orphan_shots {
+        ctx.db.projectile().id().delete(id);
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Helpers
+// Robot orchestration
 // ---------------------------------------------------------------------------
+
+/// Seat a robot opposite the human if the room doesn't have one yet.
+fn ensure_robot(ctx: &ReducerContext, code: &str, level: Difficulty) -> Result<(), String> {
+    let seated = players_in(ctx, code);
+    if seated.iter().any(|p| p.is_robot) {
+        return Ok(());
+    }
+    let slot = free_slot(&seated).ok_or("This match already has two players.")?;
+    let identity = robot_identity_for(code);
+
+    // Defensive: a previous robot row for this identity (different room, or a
+    // room that was torn down mid-write) must not block the insert.
+    if ctx.db.player().identity().find(identity).is_some() {
+        ctx.db.player().identity().delete(identity);
+    }
+
+    let mut row = new_player_row(identity, code, slot, level.display_name().to_string());
+    row.is_robot = true;
+    row.robot_difficulty = level.as_label().to_string();
+    row.color = ROBOT_COLOR.to_string();
+    ctx.db.player().insert(row);
+
+    log::info!(
+        "room={code} seated robot '{}' ({}) in slot {slot}",
+        level.display_name(),
+        level.as_label()
+    );
+    Ok(())
+}
+
+/// The robot's aim step: search for a shot, commit it to its player row (which
+/// is what a human dragging the sliders does), and schedule the trigger pull.
+fn robot_take_aim(ctx: &ReducerContext, room: &mut MatchRoom, bot: Player) -> Result<(), String> {
+    let players = players_in(ctx, &room.room_code);
+    let Some(target) = players
+        .iter()
+        .find(|p| p.slot != bot.slot && p.hp > 0)
+        .cloned()
+    else {
+        return Ok(()); // no one left to shoot at; the impact handler ends it
+    };
+
+    let ammo = robot::Ammo {
+        standard: bot.ammo_standard,
+        cluster: bot.ammo_cluster,
+        nuke: bot.ammo_nuke,
+    };
+    if ammo.is_empty() {
+        log::info!(
+            "robot room={} is out of shells; passing the turn",
+            room.room_code
+        );
+        advance_turn(ctx, room);
+        ctx.db.match_room().room_code().update(room.clone());
+        return Ok(());
+    }
+
+    let tanks: Vec<Tank> = players.iter().map(tank_of).collect();
+    let level = Difficulty::from_label(&bot.robot_difficulty);
+    let field = robot::Battlefield {
+        shooter: tank_of(&bot),
+        target: tank_of(&target),
+        ammo,
+        terrain: &room.terrain,
+        tanks: &tanks,
+        wind: room.wind,
+    };
+
+    let Some(plan) = robot::plan_shot(&field, level, robot_seed(room)) else {
+        log::warn!(
+            "robot room={} could not find a shot; passing the turn",
+            room.room_code
+        );
+        advance_turn(ctx, room);
+        ctx.db.match_room().room_code().update(room.clone());
+        return Ok(());
+    };
+
+    log::info!(
+        "robot room={} turn={} level={} weapon={} angle={:.1} power={:.1} \
+         predicts ({:.0},{:.0}) miss={:.1}px hit={}",
+        room.room_code,
+        room.turn_id,
+        level.as_label(),
+        plan.weapon_id,
+        plan.angle,
+        plan.power,
+        plan.predicted_x,
+        plan.predicted_y,
+        plan.miss_distance,
+        plan.expects_hit
+    );
+
+    let mut aiming = bot;
+    aiming.angle = plan.angle;
+    aiming.power = plan.power;
+    aiming.selected_weapon = plan.weapon_id.to_string();
+    ctx.db.player().identity().update(aiming);
+
+    ctx.db.robot_timer().insert(RobotTimer {
+        scheduled_id: 0,
+        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, ROBOT_AIM_MS)),
+        room_code: room.room_code.clone(),
+        turn_id: room.turn_id,
+        phase: PHASE_FIRE,
+    });
+    Ok(())
+}
+
+/// Deterministic per-turn seed for the robot's aim error, so replaying a turn
+/// reproduces the same "mistake".
+fn robot_seed(room: &MatchRoom) -> u64 {
+    (room.terrain_seed as u64) ^ room.turn_id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+// ---------------------------------------------------------------------------
+// Room / seating helpers
+// ---------------------------------------------------------------------------
+
+/// Find the room or create it in the waiting state.
+fn ensure_room(ctx: &ReducerContext, code: &str, solo: bool) -> MatchRoom {
+    if let Some(room) = ctx.db.match_room().room_code().find(code.to_string()) {
+        return room;
+    }
+    ctx.db.match_room().insert(MatchRoom {
+        room_code: code.to_string(),
+        status: STATUS_WAITING.to_string(),
+        active_player_slot: 0,
+        terrain_seed: seed_from(ctx.timestamp),
+        wind: 0.0,
+        width: sim::WIDTH as u32,
+        height: sim::HEIGHT as u32,
+        winner_identity: None,
+        turn_started_at: None,
+        disconnect_deadline: None,
+        turn_id: 0,
+        terrain: Vec::new(),
+        solo,
+        last_activity: ctx.timestamp,
+    })
+}
+
+/// Seat `ctx.sender` in `code`: reconnect, switch rooms, or take a fresh seat.
+fn seat_caller(
+    ctx: &ReducerContext,
+    code: &str,
+    name: &str,
+    client_id: &str,
+) -> Result<(), String> {
+    match ctx.db.player().identity().find(ctx.sender) {
+        Some(mut p) if p.room_code == code => {
+            p.connected = true;
+            if let Some(n) = safe_name(name) {
+                p.name = n;
+            }
+            p.client_id = client_id.to_string();
+            ctx.db.player().identity().update(p);
+            Ok(())
+        }
+        Some(previous) => {
+            // Player is in a different room — leave it, then take a new seat.
+            let old_code = previous.room_code.clone();
+            ctx.db.player().identity().delete(ctx.sender);
+            if players_in(ctx, &old_code).iter().all(|r| r.is_robot) {
+                demolish_room(ctx, &old_code);
+            }
+            seat_new_player(ctx, code, name, client_id)
+        }
+        None => seat_new_player(ctx, code, name, client_id),
+    }
+}
 
 fn seat_new_player(
     ctx: &ReducerContext,
@@ -525,110 +862,69 @@ fn seat_new_player(
     client_id: &str,
 ) -> Result<(), String> {
     let seated = players_in(ctx, code);
-    if seated.len() >= 2 {
-        return Err("This match already has two players.".to_string());
-    }
-    let taken: Vec<u8> = seated.iter().map(|p| p.slot).collect();
-    let slot: u8 = if !taken.contains(&0) { 0 } else { 1 };
+    let slot = free_slot(&seated).ok_or("This match already has two players.")?;
+    let display = safe_name(name).unwrap_or_else(|| default_name(slot));
+    let mut row = new_player_row(ctx.sender, code, slot, display);
+    row.client_id = client_id.to_string();
+    ctx.db.player().insert(row);
+    Ok(())
+}
 
-    ctx.db.player().insert(Player {
-        identity: ctx.sender,
+fn new_player_row(identity: Identity, code: &str, slot: u8, name: String) -> Player {
+    Player {
+        identity,
         room_code: code.to_string(),
         slot,
-        name: safe_name(name).unwrap_or_else(|| default_name(slot)),
+        name,
         color: color_for(slot),
-        hp: 100,
+        hp: STARTING_HP,
         angle: if slot == 0 { 45.0 } else { 135.0 },
         power: 60.0,
         x: if slot == 0 { 200.0 } else { 1000.0 },
         y: 0.0,
         connected: true,
-        ammo_standard: 99,
-        ammo_cluster: 3,
-        ammo_nuke: 1,
-        selected_weapon: "standard".to_string(),
-        client_id: client_id.to_string(),
-    });
-    Ok(())
+        ammo_standard: AMMO_STANDARD,
+        ammo_cluster: AMMO_CLUSTER,
+        ammo_nuke: AMMO_NUKE,
+        selected_weapon: sim::WEAPON_STANDARD.to_string(),
+        client_id: String::new(),
+        is_robot: false,
+        robot_difficulty: String::new(),
+        shots_fired: 0,
+    }
 }
 
-/// Deduct ammo, commit the shot's aim, simulate the arc, insert the projectile
-/// row, and schedule its impact. Shared by `fire_weapon` (manual) and
-/// `process_turn_timeout` (auto-fire), so the shooter comes from `player`,
-/// not `ctx.sender`.
-fn launch_shot(
-    ctx: &ReducerContext,
-    mut player: Player,
-    room: &MatchRoom,
-    angle: f32,
-    power: f32,
-    wid: &'static str,
-) -> Result<(), String> {
-    let ammo = match wid {
-        "cluster" => player.ammo_cluster,
-        "nuke" => player.ammo_nuke,
-        _ => player.ammo_standard,
+fn free_slot(seated: &[Player]) -> Option<u8> {
+    (0u8..2).find(|slot| !seated.iter().any(|p| p.slot == *slot))
+}
+
+/// Resume a paused match or start a full one. Shared by the multiplayer join
+/// and solo-create paths so both reach "playing" the same way.
+fn settle_lobby(ctx: &ReducerContext, code: &str) -> Result<(), String> {
+    let Some(mut room) = ctx.db.match_room().room_code().find(code.to_string()) else {
+        return Ok(());
     };
-    if ammo == 0 {
-        return Err(format!("No ammo remaining for {wid}."));
+    let seated = players_in(ctx, code);
+    let connected = seated.iter().filter(|p| p.connected).count();
+
+    if room.status == STATUS_PAUSED && connected >= 2 {
+        room.status = STATUS_PLAYING.to_string();
+        room.disconnect_deadline = None;
+        room.last_activity = ctx.timestamp;
+        // Restart the active player's turn clock — unless a shot is mid-air,
+        // in which case its impact will begin the next turn.
+        if !projectile_in_flight(ctx, code) {
+            begin_turn(ctx, &mut room);
+        }
+        ctx.db.match_room().room_code().update(room);
+        log::info!("room={code} resumed");
+        return Ok(());
     }
 
-    match wid {
-        "cluster" => player.ammo_cluster -= 1,
-        "nuke" => player.ammo_nuke -= 1,
-        _ => player.ammo_standard -= 1,
+    if room.status == STATUS_WAITING && seated.len() == 2 && connected == 2 {
+        return start_match(ctx, code);
     }
-    let angle = clamp(angle, 0.0, 180.0);
-    let power = clamp(power, 1.0, 100.0);
-    player.angle = angle;
-    player.power = power;
-    player.selected_weapon = wid.to_string();
-    ctx.db.player().identity().update(player.clone());
-
-    let players = players_in(ctx, &player.room_code);
-    let w = weapon(wid);
-    let sim = simulate_projectile(&player, &room.terrain, &players, angle, power, room.wind);
-
-    let proj = ctx.db.projectile().insert(Projectile {
-        id: 0,
-        room_code: player.room_code.clone(),
-        player_identity: player.identity,
-        weapon_id: wid.to_string(),
-        start_x: sim.start_x,
-        start_y: sim.start_y,
-        vx: sim.vx,
-        vy: sim.vy,
-        impact_x: sim.impact_x,
-        impact_y: sim.impact_y,
-        radius: w.explosion_radius,
-        tti_ms: sim.tti_ms,
-    });
-
-    ctx.db.impact_timer().insert(ImpactTimer {
-        scheduled_id: 0,
-        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, sim.tti_ms as i64)),
-        room_code: player.room_code.clone(),
-        projectile_id: proj.id,
-    });
-
     Ok(())
-}
-
-/// Start a fresh turn clock: bump the turn generation, stamp the start time,
-/// and arm the 30s auto-fire timeout. Mutates `room`; the caller commits it.
-fn begin_turn(ctx: &ReducerContext, room: &mut MatchRoom) {
-    room.turn_id += 1;
-    room.turn_started_at = Some(ctx.timestamp);
-    ctx.db.turn_timer().insert(TurnTimer {
-        scheduled_id: 0,
-        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, TURN_MS)),
-        room_code: room.room_code.clone(),
-        turn_id: room.turn_id,
-    });
-}
-
-fn projectile_in_flight(ctx: &ReducerContext, code: &str) -> bool {
-    ctx.db.projectile().iter().any(|p| p.room_code == code)
 }
 
 fn start_match(ctx: &ReducerContext, code: &str) -> Result<(), String> {
@@ -638,21 +934,185 @@ fn start_match(ctx: &ReducerContext, code: &str) -> Result<(), String> {
         .room_code()
         .find(code.to_string())
         .ok_or("Room not found.")?;
-    let terrain = generate_terrain(room.terrain_seed);
+    let terrain = sim::generate_terrain(room.terrain_seed);
 
     for mut p in players_in(ctx, code) {
-        p.y = get_terrain_height(&terrain, p.x);
+        p.y = sim::get_terrain_height(&terrain, p.x);
         ctx.db.player().identity().update(p);
     }
 
     room.terrain = terrain;
-    room.status = "playing".to_string();
+    room.status = STATUS_PLAYING.to_string();
     room.active_player_slot = 0;
     room.disconnect_deadline = None;
     room.winner_identity = None;
     begin_turn(ctx, &mut room);
     ctx.db.match_room().room_code().update(room);
+    log::info!("room={code} match started");
     Ok(())
+}
+
+/// Delete a room and everything belonging to it.
+fn demolish_room(ctx: &ReducerContext, code: &str) {
+    for p in players_in(ctx, code) {
+        ctx.db.player().identity().delete(p.identity);
+    }
+    let shots: Vec<u64> = ctx
+        .db
+        .projectile()
+        .iter()
+        .filter(|p| p.room_code == code)
+        .map(|p| p.id)
+        .collect();
+    for id in shots {
+        ctx.db.projectile().id().delete(id);
+    }
+    ctx.db.match_room().room_code().delete(code.to_string());
+}
+
+// ---------------------------------------------------------------------------
+// Turn helpers
+// ---------------------------------------------------------------------------
+
+/// Start a fresh turn clock: bump the turn generation, stamp the start time,
+/// arm the auto-fire timeout, and hand off to the robot brain if the turn
+/// belongs to one. Mutates `room`; the caller commits it.
+fn begin_turn(ctx: &ReducerContext, room: &mut MatchRoom) {
+    room.turn_id += 1;
+    room.turn_started_at = Some(ctx.timestamp);
+    room.last_activity = ctx.timestamp;
+    ctx.db.turn_timer().insert(TurnTimer {
+        scheduled_id: 0,
+        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, TURN_MS)),
+        room_code: room.room_code.clone(),
+        turn_id: room.turn_id,
+    });
+
+    let robot_turn = players_in(ctx, &room.room_code)
+        .into_iter()
+        .any(|p| p.slot == room.active_player_slot && p.is_robot && p.hp > 0);
+    if robot_turn {
+        ctx.db.robot_timer().insert(RobotTimer {
+            scheduled_id: 0,
+            scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, ROBOT_THINK_MS)),
+            room_code: room.room_code.clone(),
+            turn_id: room.turn_id,
+            phase: PHASE_AIM,
+        });
+    }
+}
+
+/// Hand the turn to the next living player and start their clock.
+fn advance_turn(ctx: &ReducerContext, room: &mut MatchRoom) {
+    let players = players_in(ctx, &room.room_code);
+    room.active_player_slot = next_living_slot(room.active_player_slot, &players);
+    begin_turn(ctx, room);
+}
+
+/// Close the match out. `winner` is `None` for a draw.
+fn finish_match(ctx: &ReducerContext, room: &mut MatchRoom, winner: Option<Identity>) {
+    room.status = STATUS_FINISHED.to_string();
+    room.winner_identity = winner;
+    room.turn_started_at = None;
+    room.disconnect_deadline = None;
+    room.last_activity = ctx.timestamp;
+    log::info!(
+        "room={} finished (winner: {})",
+        room.room_code,
+        winner
+            .map(|w| w.to_hex().to_string())
+            .unwrap_or_else(|| "draw".to_string())
+    );
+}
+
+/// Deduct ammo, commit the shot's aim, simulate the arc, insert the projectile
+/// row, and schedule its impact. Shared by `fire_weapon` (manual),
+/// `process_turn_timeout` (auto-fire) and `process_robot_turn` (AI), so the
+/// shooter comes from `player`, not `ctx.sender`.
+fn launch_shot(
+    ctx: &ReducerContext,
+    mut player: Player,
+    room: &MatchRoom,
+    angle: f32,
+    power: f32,
+    wid: &'static str,
+) -> Result<(), String> {
+    if ammo_for(&player, wid) == 0 {
+        return Err(format!("No ammo remaining for {wid}."));
+    }
+
+    match wid {
+        sim::WEAPON_CLUSTER => player.ammo_cluster -= 1,
+        sim::WEAPON_NUKE => player.ammo_nuke -= 1,
+        _ => player.ammo_standard -= 1,
+    }
+    let angle = sim::clamp(angle, 0.0, 180.0);
+    let power = sim::clamp(power, 1.0, 100.0);
+    player.angle = angle;
+    player.power = power;
+    player.selected_weapon = wid.to_string();
+    player.shots_fired += 1;
+    ctx.db.player().identity().update(player.clone());
+
+    let tanks: Vec<Tank> = players_in(ctx, &player.room_code)
+        .iter()
+        .map(tank_of)
+        .collect();
+    let w = sim::weapon(wid);
+    let shot = sim::simulate_projectile(
+        &tank_of(&player),
+        &room.terrain,
+        &tanks,
+        angle,
+        power,
+        room.wind,
+    );
+
+    let proj = ctx.db.projectile().insert(Projectile {
+        id: 0,
+        room_code: player.room_code.clone(),
+        player_identity: player.identity,
+        weapon_id: wid.to_string(),
+        start_x: shot.start_x,
+        start_y: shot.start_y,
+        vx: shot.vx,
+        vy: shot.vy,
+        impact_x: shot.impact_x,
+        impact_y: shot.impact_y,
+        radius: w.explosion_radius,
+        tti_ms: shot.tti_ms,
+    });
+
+    ctx.db.impact_timer().insert(ImpactTimer {
+        scheduled_id: 0,
+        scheduled_at: ScheduleAt::Time(plus_millis(ctx.timestamp, shot.tti_ms as i64)),
+        room_code: player.room_code.clone(),
+        projectile_id: proj.id,
+    });
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+/// Scheduled reducers are public API surface; reject direct client calls.
+fn scheduler_only(ctx: &ReducerContext) -> Result<(), String> {
+    if ctx.sender != ctx.identity() {
+        return Err("Scheduled reducers cannot be called by clients.".to_string());
+    }
+    Ok(())
+}
+
+fn active_player(ctx: &ReducerContext, room: &MatchRoom) -> Option<Player> {
+    players_in(ctx, &room.room_code)
+        .into_iter()
+        .find(|p| p.slot == room.active_player_slot && p.hp > 0)
+}
+
+fn projectile_in_flight(ctx: &ReducerContext, code: &str) -> bool {
+    ctx.db.projectile().iter().any(|p| p.room_code == code)
 }
 
 fn players_in(ctx: &ReducerContext, code: &str) -> Vec<Player> {
@@ -666,125 +1126,15 @@ fn players_in(ctx: &ReducerContext, code: &str) -> Vec<Player> {
     players
 }
 
-struct Weapon {
-    explosion_radius: f32,
-    damage: f32,
+fn tank_of(p: &Player) -> Tank {
+    Tank::new(p.x, p.y, p.hp)
 }
 
-fn weapon(id: &str) -> Weapon {
-    match id {
-        "cluster" => Weapon {
-            explosion_radius: 45.0,
-            damage: 15.0,
-        },
-        "nuke" => Weapon {
-            explosion_radius: 130.0,
-            damage: 55.0,
-        },
-        _ => Weapon {
-            explosion_radius: 60.0,
-            damage: 25.0,
-        },
-    }
-}
-
-struct Sim {
-    start_x: f32,
-    start_y: f32,
-    vx: f32,
-    vy: f32,
-    impact_x: f32,
-    impact_y: f32,
-    tti_ms: u64,
-}
-
-fn simulate_projectile(
-    shooter: &Player,
-    terrain: &[f32],
-    players: &[Player],
-    angle: f32,
-    power: f32,
-    wind: f32,
-) -> Sim {
-    let radians = clamp(angle, 0.0, 180.0) * PI / 180.0;
-    let speed = clamp(power, 1.0, 100.0) * 0.35 + 2.0;
-    let start_x = shooter.x + radians.cos() * 20.0;
-    let start_y = shooter.y - 15.0 - radians.sin() * 20.0;
-    let vx0 = radians.cos() * speed;
-    let vy0 = -radians.sin() * speed;
-
-    let (mut x, mut y) = (start_x, start_y);
-    let (mut vx, mut vy) = (vx0, vy0);
-    let (mut impact_x, mut impact_y) = (x, y);
-    let mut tick: u64 = 0;
-
-    while tick < MAX_TICKS {
-        x += vx;
-        y += vy;
-        vy += GRAVITY;
-        vx += wind;
-        impact_x = x;
-        impact_y = y;
-        if has_collided(x, y, terrain, players) {
-            break;
-        }
-        tick += 1;
-    }
-
-    Sim {
-        start_x,
-        start_y,
-        vx: vx0,
-        vy: vy0,
-        impact_x: round2(impact_x),
-        impact_y: round2(impact_y),
-        tti_ms: ((tick + 1) * TICK_MS).max(TICK_MS),
-    }
-}
-
-fn has_collided(px: f32, py: f32, terrain: &[f32], players: &[Player]) -> bool {
-    if py > HEIGHT as f32 || px < 0.0 || px > WIDTH as f32 {
-        return true;
-    }
-    let ix = px.floor() as i32;
-    if ix >= 0 && (ix as usize) < terrain.len() && py >= terrain[ix as usize] {
-        return true;
-    }
-    players
-        .iter()
-        .any(|p| p.hp > 0 && ((p.x - px).powi(2) + ((p.y - 8.0) - py).powi(2)).sqrt() < 15.0)
-}
-
-fn generate_terrain(seed: i64) -> Vec<f32> {
-    let o1 = seeded_range(seed, 1) * 1000.0;
-    let o2 = seeded_range(seed, 2) * 1000.0;
-    let o3 = seeded_range(seed, 3) * 1000.0;
-    let mut terrain = Vec::with_capacity(WIDTH);
-    for x in 0..WIDTH {
-        let xf = x as f32;
-        let mut y = HEIGHT as f32 * 0.6;
-        y += ((xf + o1) / 200.0).sin() * 80.0;
-        y += ((xf + o2) / 70.0).sin() * 30.0;
-        y += ((xf + o3) / 15.0).sin() * 5.0;
-        terrain.push(round2(y));
-    }
-    terrain
-}
-
-fn seeded_range(seed: i64, salt: i64) -> f32 {
-    let mut v = (seed.wrapping_add(salt.wrapping_mul(0x9e37_79b9)) as u64 & 0xffff_ffff) as u32;
-    v = (v ^ (v >> 16)).wrapping_mul(0x85eb_ca6b);
-    v = (v ^ (v >> 13)).wrapping_mul(0xc2b2_ae35);
-    v ^= v >> 16;
-    (v as f32) / (u32::MAX as f32)
-}
-
-fn get_terrain_height(terrain: &[f32], x: f32) -> f32 {
-    let ix = x.floor() as i32;
-    if ix >= 0 && (ix as usize) < terrain.len() {
-        terrain[ix as usize]
-    } else {
-        HEIGHT as f32
+fn ammo_for(p: &Player, wid: &str) -> u32 {
+    match sim::normalize_weapon(wid) {
+        sim::WEAPON_CLUSTER => p.ammo_cluster,
+        sim::WEAPON_NUKE => p.ammo_nuke,
+        _ => p.ammo_standard,
     }
 }
 
@@ -800,15 +1150,26 @@ fn next_living_slot(current: u8, players: &[Player]) -> u8 {
     current
 }
 
-fn clamp(v: f32, min: f32, max: f32) -> f32 {
-    if !v.is_finite() {
-        return min;
-    }
-    v.max(min).min(max)
+/// Stable synthetic identity for a room's robot, so reconnects and republishes
+/// keep talking about the same tank.
+fn robot_identity_for(code: &str) -> Identity {
+    let a = fnv1a64(code.as_bytes(), 0xcbf2_9ce4_8422_2325);
+    let b = fnv1a64(code.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    let mut bytes = [0u8; 32];
+    bytes[0..8].copy_from_slice(&ROBOT_ID_TAG);
+    bytes[8..16].copy_from_slice(&a.to_le_bytes());
+    bytes[16..24].copy_from_slice(&b.to_le_bytes());
+    bytes[24..32].copy_from_slice(&(a ^ b).to_le_bytes());
+    Identity::from_byte_array(bytes)
 }
 
-fn round2(v: f32) -> f32 {
-    (v * 100.0).round() / 100.0
+fn fnv1a64(bytes: &[u8], basis: u64) -> u64 {
+    let mut hash = basis;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Deterministic terrain seed derived from the room's creation timestamp.
@@ -828,14 +1189,6 @@ fn normalize_code(raw: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(12)
         .collect()
-}
-
-fn normalize_weapon(id: &str) -> &'static str {
-    match id {
-        "cluster" => "cluster",
-        "nuke" => "nuke",
-        _ => "standard",
-    }
 }
 
 fn safe_name(name: &str) -> Option<String> {

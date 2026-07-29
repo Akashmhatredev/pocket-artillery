@@ -8,5 +8,6 @@ coverage/
 
 # Rust / SpacetimeDB module build artifacts
 stdb-module/target/
+stdb-module/tests-core/target/
 # NOTE: module_bindings/ is intentionally COMMITTED so Vercel can build the
 # frontend without the SpacetimeDB CLI. Regenerate it with `npm run stdb:generate`.
