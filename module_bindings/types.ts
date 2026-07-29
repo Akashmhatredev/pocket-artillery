@@ -10,6 +10,12 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
+export const CleanupTimer = __t.object("CleanupTimer", {
+  scheduledId: __t.u64(),
+  scheduledAt: __t.scheduleAt(),
+});
+export type CleanupTimer = __Infer<typeof CleanupTimer>;
+
 export const ForfeitTimer = __t.object("ForfeitTimer", {
   scheduledId: __t.u64(),
   scheduledAt: __t.scheduleAt(),
@@ -39,6 +45,8 @@ export const MatchRoom = __t.object("MatchRoom", {
   disconnectDeadline: __t.option(__t.timestamp()),
   turnId: __t.u64(),
   terrain: __t.array(__t.f32()),
+  solo: __t.bool(),
+  lastActivity: __t.timestamp(),
 });
 export type MatchRoom = __Infer<typeof MatchRoom>;
 
@@ -59,6 +67,9 @@ export const Player = __t.object("Player", {
   ammoNuke: __t.u32(),
   selectedWeapon: __t.string(),
   clientId: __t.string(),
+  isRobot: __t.bool(),
+  robotDifficulty: __t.string(),
+  shotsFired: __t.u32(),
 });
 export type Player = __Infer<typeof Player>;
 
@@ -77,6 +88,15 @@ export const Projectile = __t.object("Projectile", {
   ttiMs: __t.u64(),
 });
 export type Projectile = __Infer<typeof Projectile>;
+
+export const RobotTimer = __t.object("RobotTimer", {
+  scheduledId: __t.u64(),
+  scheduledAt: __t.scheduleAt(),
+  roomCode: __t.string(),
+  turnId: __t.u64(),
+  phase: __t.u8(),
+});
+export type RobotTimer = __Infer<typeof RobotTimer>;
 
 export const TurnTimer = __t.object("TurnTimer", {
   scheduledId: __t.u64(),

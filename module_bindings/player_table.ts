@@ -27,4 +27,7 @@ export default __t.row({
   ammoNuke: __t.u32().name("ammo_nuke"),
   selectedWeapon: __t.string().name("selected_weapon"),
   clientId: __t.string().name("client_id"),
+  isRobot: __t.bool().name("is_robot"),
+  robotDifficulty: __t.string().name("robot_difficulty"),
+  shotsFired: __t.u32().name("shots_fired"),
 });

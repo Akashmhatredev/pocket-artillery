@@ -1,0 +1,11 @@
+[package]
+name = "pocket-artillery-core-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone on purpose: it must not be pulled into the module build, and the
+# module crate itself cannot be a dependency (it only links against the
+# SpacetimeDB WASM host ABI). This crate includes the module's *pure* sources
+# directly so their `#[cfg(test)]` suites run on the host target.
+[workspace]

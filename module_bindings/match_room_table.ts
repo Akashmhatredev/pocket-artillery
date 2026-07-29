@@ -23,4 +23,6 @@ export default __t.row({
   disconnectDeadline: __t.option(__t.timestamp()).name("disconnect_deadline"),
   turnId: __t.u64().name("turn_id"),
   terrain: __t.array(__t.f32()),
+  solo: __t.bool(),
+  lastActivity: __t.timestamp().name("last_activity"),
 });

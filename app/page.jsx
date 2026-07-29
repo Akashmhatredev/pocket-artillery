@@ -5,6 +5,7 @@ import { GameEngine } from '@/lib/engine';
 import { Slider } from '@radix-ui/react-slider';
 import {
     Bomb,
+    Bot,
     Check,
     Clipboard,
     Link2,
@@ -16,6 +17,7 @@ import {
     Share2,
     Shield,
     Skull,
+    Swords,
     Target,
     Timer,
     User,
@@ -27,10 +29,18 @@ import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import {
     MULTIPLAYER_STORAGE_KEY,
+    generateRoomCode,
     getOrCreateClientId,
     normalizeRoomCode
 } from '@/lib/multiplayer/client';
 import { MultiplayerConnection } from '@/lib/multiplayer/spacetime';
+import {
+    appendFeed,
+    buildSummary,
+    describeEvent,
+    describeOutcome,
+    difficultyLabel
+} from '@/lib/game/feed';
 
 function cn(...inputs) {
     return twMerge(clsx(inputs));
@@ -47,6 +57,21 @@ const WEAPONS = [
     { id: 'standard', name: 'Standard', icon: Target },
     { id: 'cluster', name: 'Cluster', icon: Bomb },
     { id: 'nuke', name: 'Mini Nuke', icon: Skull },
+];
+
+// 'practice' is the offline hot-seat sandbox driven purely by the local engine.
+// 'solo' and 'multi' are both real server-backed matches — the only difference
+// is that solo's opponent is a robot the module seats for you.
+const MODE = {
+    PRACTICE: 'practice',
+    SOLO: 'solo',
+    MULTI: 'multi',
+};
+
+const DIFFICULTIES = [
+    { id: 'easy', name: 'Easy', hint: 'Rookie aim, hoards its specials' },
+    { id: 'normal', name: 'Normal', hint: 'Solid aim, saves the nuke' },
+    { id: 'hard', name: 'Hard', hint: 'Ruthless aim, punishes mistakes' },
 ];
 
 const DEFAULT_PLAYER_NAME = 'Commander';
@@ -154,7 +179,7 @@ export default function Home() {
     const aimSyncRef = useRef({ last: 0, timer: null, angle: null, power: null });
 
     const [screen, setScreen] = useState('home');
-    const [mode, setMode] = useState('single');
+    const [mode, setMode] = useState(MODE.PRACTICE);
     const [gameState, setGameState] = useState(EMPTY_GAME_STATE);
     const [roomState, setRoomState] = useState(null);
     const [session, setSession] = useState(null);
@@ -169,12 +194,30 @@ export default function Home() {
     const [renameOpen, setRenameOpen] = useState(false);
     const [nameDraft, setNameDraft] = useState('');
     const [confirmQuit, setConfirmQuit] = useState(false);
-    const [soloDeadline, setSoloDeadline] = useState(null);
+    const [practiceDeadline, setPracticeDeadline] = useState(null);
     const [timeLeft, setTimeLeft] = useState(null);
+    const [difficulty, setDifficulty] = useState('normal');
+    const [feed, setFeed] = useState([]);
+
+    const feedIdRef = useRef(0);
 
     const showToast = useCallback((message) => {
         setToast(message);
         window.setTimeout(() => setToast(null), 2600);
+    }, []);
+
+    const isOnline = mode === MODE.MULTI || mode === MODE.SOLO;
+
+    // Latest known roster, so feed lines for events that don't carry a full
+    // state (a projectile spawn) can still name who did what.
+    const rosterRef = useRef([]);
+
+    const pushFeed = useCallback((event) => {
+        const entry = describeEvent(event, rosterRef.current, myPlayerIdRef.current);
+        if (!entry) return;
+        feedIdRef.current += 1;
+        const id = feedIdRef.current;
+        setFeed((current) => appendFeed(current, entry, id));
     }, []);
 
     const syncRoomToEngine = useCallback((state) => {
@@ -206,6 +249,11 @@ export default function Home() {
     }, []);
 
     const handleServerEvent = useCallback((event) => {
+        if (event.state?.players) {
+            rosterRef.current = event.state.players;
+        }
+        pushFeed(event);
+
         if (event.type === 'AIM_UPDATE') {
             // Hot path: move the canvas barrel directly; only mirror the
             // sliders for the opponent's aim (our own echo would fight the drag).
@@ -218,6 +266,9 @@ export default function Home() {
         }
 
         if (event.type === 'JOINED') {
+            // Set the ref now rather than waiting for the session effect, so the
+            // very first feed line already knows which tank is ours.
+            myPlayerIdRef.current = event.playerId ?? null;
             setSession((current) => {
                 if (!current) return current;
                 const nextSession = { ...current, playerId: event.playerId };
@@ -269,12 +320,16 @@ export default function Home() {
         if (event.type === 'ERROR') {
             showToast(event.message);
         }
-    }, [showToast, syncRoomToEngine]);
+    }, [pushFeed, showToast, syncRoomToEngine]);
 
-    const connectToRoom = useCallback((roomCode, isHost, playerId = null) => {
+    // Opens a server-backed match. `options.solo` seats a robot opponent and
+    // starts immediately; otherwise we wait in the lobby for a second human.
+    const connectToRoom = useCallback((roomCode, isHost, playerId = null, options = {}) => {
         const normalized = normalizeRoomCode(roomCode);
         const clientId = getOrCreateClientId();
         const resolvedName = resolveName(playerNameRef.current);
+        const solo = options.solo === true;
+        const level = options.difficulty ?? 'normal';
         const nextSession = {
             roomCode: normalized,
             clientId,
@@ -282,16 +337,23 @@ export default function Home() {
             matchId: null,
             isHost,
             name: resolvedName,
+            solo,
+            difficulty: level,
         };
 
         connectionRef.current?.disconnect();
-        const connection = new MultiplayerConnection(normalized, clientId, playerId, resolvedName);
+        const connection = new MultiplayerConnection(normalized, clientId, playerId, resolvedName, {
+            solo,
+            difficulty: level,
+        });
         connectionRef.current = connection;
         connection.onMessage(handleServerEvent);
         connection.onStatus(setConnectionStatus);
         connection.connect();
 
-        setMode('multi');
+        rosterRef.current = [];
+        setFeed([]);
+        setMode(solo ? MODE.SOLO : MODE.MULTI);
         setScreen('waiting');
         setSession(nextSession);
         storeSession(nextSession);
@@ -339,18 +401,27 @@ export default function Home() {
     useEffect(() => {
         const storedSession = getStoredSession();
         if (storedSession?.roomCode) {
-            window.setTimeout(() => connectToRoom(storedSession.roomCode, storedSession.isHost, storedSession.playerId), 0);
+            window.setTimeout(() => connectToRoom(
+                storedSession.roomCode,
+                storedSession.isHost,
+                storedSession.playerId,
+                { solo: storedSession.solo === true, difficulty: storedSession.difficulty }
+            ), 0);
         }
     }, [connectToRoom]);
 
     const activePlayer = gameState.players[gameState.currentPlayerIndex];
     const currentTheme = getPlayerTheme(gameState.currentPlayerIndex);
     const myPlayer = roomState?.players.find((player) => player.id === session?.playerId);
-    const isMyTurn = mode === 'single' || (!!myPlayer && roomState?.players[roomState.activePlayerIndex]?.id === myPlayer.id);
-    const controlsDisabled = gameState.isFiring || !!gameState.winner || (mode === 'multi' && (!isMyTurn || roomState?.status !== 'playing'));
+    const isMyTurn = !isOnline || (!!myPlayer && roomState?.players[roomState.activePlayerIndex]?.id === myPlayer.id);
+    const controlsDisabled = gameState.isFiring || !!gameState.winner || (isOnline && (!isMyTurn || roomState?.status !== 'playing'));
     const connectedCount = roomState?.players.filter((player) => player.connected).length ?? 0;
     const opponent = roomState?.players.find((player) => player.id !== session?.playerId);
     const roomUrl = typeof window === 'undefined' || !session ? '' : `${window.location.origin}?room=${session.roomCode}`;
+    const summary = useMemo(
+        () => (gameState.winner ? buildSummary(roomState, session?.playerId) : []),
+        [gameState.winner, roomState, session?.playerId]
+    );
 
     // Re-seed the sliders from server state only when the turn changes —
     // running this on every state sync would fight an in-progress drag.
@@ -364,21 +435,21 @@ export default function Home() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [gameState.currentPlayerIndex, gameState.isFiring, mode, screen]);
 
-    // Solo mode keeps its own 30s clock per turn; multiplayer trusts the
-    // server's turn_started_at (the module auto-fires on timeout).
+    // Offline practice keeps its own 30s clock per turn; server-backed matches
+    // trust turn_started_at (the module auto-fires on timeout).
     useEffect(() => {
-        if (mode !== 'single' || screen !== 'game' || gameState.isFiring || gameState.winner || gameState.players.length === 0) {
-            setSoloDeadline(null);
+        if (isOnline || screen !== 'game' || gameState.isFiring || gameState.winner || gameState.players.length === 0) {
+            setPracticeDeadline(null);
             return;
         }
-        setSoloDeadline(Date.now() + TURN_SECONDS * 1000);
-    }, [mode, screen, gameState.currentPlayerIndex, gameState.isFiring, gameState.winner, gameState.players.length]);
+        setPracticeDeadline(Date.now() + TURN_SECONDS * 1000);
+    }, [isOnline, screen, gameState.currentPlayerIndex, gameState.isFiring, gameState.winner, gameState.players.length]);
 
-    const turnDeadline = mode === 'multi'
+    const turnDeadline = isOnline
         ? (roomState?.status === 'playing' && roomState.turnStartedAt
             ? roomState.turnStartedAt + (roomState.turnDurationMs ?? TURN_SECONDS * 1000)
             : null)
-        : soloDeadline;
+        : practiceDeadline;
 
     useEffect(() => {
         if (!turnDeadline || gameState.isFiring || gameState.winner) {
@@ -394,13 +465,14 @@ export default function Home() {
         return () => window.clearInterval(id);
     }, [turnDeadline, gameState.isFiring, gameState.winner]);
 
-    // Solo auto-shoot when the clock hits zero, using the current aim + weapon.
+    // Practice auto-shoot when the clock hits zero, using the current aim +
+    // weapon. Server-backed matches are auto-fired by the module instead.
     useEffect(() => {
-        if (mode !== 'single' || timeLeft !== 0 || !soloDeadline) return;
+        if (isOnline || timeLeft !== 0 || !practiceDeadline) return;
         if (gameState.isFiring || gameState.winner) return;
-        setSoloDeadline(null);
+        setPracticeDeadline(null);
         engineRef.current?.fire(weapon);
-    }, [mode, timeLeft, soloDeadline, gameState.isFiring, gameState.winner, weapon]);
+    }, [isOnline, timeLeft, practiceDeadline, gameState.isFiring, gameState.winner, weapon]);
 
     const createGame = async () => {
         setLoading(true);
@@ -436,12 +508,24 @@ export default function Home() {
         }
     };
 
-    const startSinglePlayer = () => {
+    // Solo play is a real server-backed match; the module seats the robot and
+    // starts it immediately, so there is no lobby to wait in.
+    const startSoloMatch = useCallback((level = difficulty) => {
+        setWeapon('standard');
+        setAngle(45);
+        setPower(60);
+        connectToRoom(generateRoomCode(), true, null, { solo: true, difficulty: level });
+    }, [connectToRoom, difficulty]);
+
+    const startPractice = () => {
         connectionRef.current?.disconnect();
+        connectionRef.current = null;
         storeSession(null);
-        setMode('single');
+        setMode(MODE.PRACTICE);
         setSession(null);
         setRoomState(null);
+        setConnectionStatus('idle');
+        setFeed([]);
         setScreen('game');
         engineRef.current?.reset(true);
         engineRef.current?.setLocalName(resolveName(playerNameRef.current));
@@ -455,8 +539,10 @@ export default function Home() {
         setSession(null);
         setRoomState(null);
         setConnectionStatus('idle');
-        setMode('single');
+        setMode(MODE.PRACTICE);
         setScreen('home');
+        setFeed([]);
+        rosterRef.current = [];
         engineRef.current?.reset(true);
     };
 
@@ -476,7 +562,7 @@ export default function Home() {
             storeSession(nextSession);
             return nextSession;
         });
-        if (mode === 'multi') {
+        if (isOnline) {
             connectionRef.current?.rename(next);
         } else {
             engineRef.current?.setLocalName(next);
@@ -498,26 +584,26 @@ export default function Home() {
         if (controlsDisabled) return;
         setAngle(val);
         engineRef.current?.updateAngle(val);
-        if (mode === 'multi') sendAimThrottled(val, power);
+        if (isOnline) sendAimThrottled(val, power);
     };
 
     const handlePowerChange = (val) => {
         if (controlsDisabled) return;
         setPower(val);
         engineRef.current?.updatePower(val);
-        if (mode === 'multi') sendAimThrottled(angle, val);
+        if (isOnline) sendAimThrottled(angle, val);
     };
 
     const handleWeaponSelect = (weaponId) => {
         if (controlsDisabled) return;
         setWeapon(weaponId);
         // Sync the pick so a server-side turn timeout auto-fires this weapon.
-        if (mode === 'multi') connectionRef.current?.selectWeapon(weaponId);
+        if (isOnline) connectionRef.current?.selectWeapon(weaponId);
     };
 
     const handleFire = () => {
         if (controlsDisabled) return;
-        if (mode === 'multi') {
+        if (isOnline) {
             connectionRef.current?.fire(angle, power, weapon);
         } else {
             engineRef.current?.fire(weapon);
@@ -529,7 +615,13 @@ export default function Home() {
         setAngle(45);
         setPower(60);
 
-        if (mode === 'multi') {
+        if (mode === MODE.SOLO) {
+            // A fresh room code keeps the finished match's rows out of the way.
+            startSoloMatch(session?.difficulty ?? difficulty);
+            return;
+        }
+
+        if (mode === MODE.MULTI) {
             connectionRef.current?.disconnect();
             if (session?.isHost) {
                 await createGame();
@@ -610,7 +702,13 @@ export default function Home() {
                     <div className="w-full max-w-sm border border-slate-800 bg-[#11131C] rounded-lg p-6 shadow-2xl text-center">
                         <div className="text-[10px] text-slate-500 font-bold uppercase tracking-[0.3em] mb-2">Leave Match</div>
                         <h2 className="text-2xl font-black text-white tracking-wide mb-2">Quit the battle?</h2>
-                        <p className="text-sm text-slate-400 mb-6">{mode === 'multi' ? 'Leaving forfeits this match to your opponent.' : 'Your current game will be lost.'}</p>
+                        <p className="text-sm text-slate-400 mb-6">
+                            {mode === MODE.MULTI
+                                ? 'Leaving forfeits this match to your opponent.'
+                                : mode === MODE.SOLO
+                                    ? 'Leaving forfeits this match to the robot.'
+                                    : 'Your current game will be lost.'}
+                        </p>
                         <div className="flex gap-3">
                             <button onClick={quitMatch} className="flex-1 h-12 rounded-lg border border-rose-500 bg-rose-500/10 text-rose-100 font-black uppercase tracking-wider hover:bg-rose-500/20 transition flex items-center justify-center gap-2">
                                 <LogOut className="w-4 h-4" /> Quit
@@ -645,15 +743,45 @@ export default function Home() {
                                     </div>
                                 </div>
                             </div>
-                            <div className="grid gap-3 sm:grid-cols-3 mt-8">
-                                <button onClick={createGame} disabled={loading} className="h-14 rounded-lg border border-cyan-500 bg-cyan-500/10 text-cyan-100 font-black uppercase tracking-wider hover:bg-cyan-500/20 transition flex items-center justify-center gap-2">
-                                    {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Users className="w-4 h-4" />} Create Game
-                                </button>
-                                <button onClick={() => setScreen('joining')} className="h-14 rounded-lg border border-slate-700 bg-[#1A1D29] text-white font-black uppercase tracking-wider hover:border-rose-400 transition flex items-center justify-center gap-2">
-                                    <Link2 className="w-4 h-4" /> Join Game
-                                </button>
-                                <button onClick={startSinglePlayer} className="h-14 rounded-lg border border-slate-700 bg-[#1A1D29] text-slate-200 font-black uppercase tracking-wider hover:border-slate-400 transition">
-                                    Solo Test
+                            <div className="mt-8 space-y-4">
+                                <div className="grid gap-3 sm:grid-cols-3">
+                                    <button onClick={() => startSoloMatch()} className="h-14 rounded-lg border border-violet-500 bg-violet-500/10 text-violet-100 font-black uppercase tracking-wider hover:bg-violet-500/20 transition flex items-center justify-center gap-2">
+                                        <Bot className="w-4 h-4" /> Vs Robot
+                                    </button>
+                                    <button onClick={createGame} disabled={loading} className="h-14 rounded-lg border border-cyan-500 bg-cyan-500/10 text-cyan-100 font-black uppercase tracking-wider hover:bg-cyan-500/20 transition flex items-center justify-center gap-2">
+                                        {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Users className="w-4 h-4" />} Create Game
+                                    </button>
+                                    <button onClick={() => setScreen('joining')} className="h-14 rounded-lg border border-slate-700 bg-[#1A1D29] text-white font-black uppercase tracking-wider hover:border-rose-400 transition flex items-center justify-center gap-2">
+                                        <Link2 className="w-4 h-4" /> Join Game
+                                    </button>
+                                </div>
+
+                                <div>
+                                    <label className="text-[10px] uppercase tracking-[0.3em] text-slate-500 font-black">Robot Skill</label>
+                                    <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                                        {DIFFICULTIES.map((level) => (
+                                            <button
+                                                key={level.id}
+                                                onClick={() => setDifficulty(level.id)}
+                                                title={level.hint}
+                                                className={cn(
+                                                    "h-11 rounded-lg border text-[11px] font-black uppercase tracking-wider transition",
+                                                    difficulty === level.id
+                                                        ? "border-violet-500 bg-violet-500/10 text-violet-100"
+                                                        : "border-slate-700 bg-[#0A0B10] text-slate-400 hover:border-slate-500"
+                                                )}
+                                            >
+                                                {level.name}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <p className="mt-2 text-xs text-slate-500">
+                                        {DIFFICULTIES.find((level) => level.id === difficulty)?.hint}
+                                    </p>
+                                </div>
+
+                                <button onClick={startPractice} className="text-[11px] font-bold uppercase tracking-wider text-slate-500 hover:text-slate-300 transition flex items-center gap-2">
+                                    <Swords className="w-3.5 h-3.5" /> Or practice offline (hot seat)
                                 </button>
                             </div>
                         </div>
@@ -665,6 +793,7 @@ export default function Home() {
                                 <StatusRow label="Turns" value="Validated server-side" />
                                 <StatusRow label="Projectiles" value="Deterministic backend arcs" />
                                 <StatusRow label="Damage" value="Authoritative HP sync" />
+                                <StatusRow label="Robot" value="Plays by the same rules" />
                                 <StatusRow label="Reconnects" value="60 second grace window" />
                             </div>
                         </div>
@@ -696,37 +825,52 @@ export default function Home() {
                     <div className="w-full max-w-3xl border border-slate-800 bg-[#11131C] rounded-lg p-5 sm:p-7 shadow-2xl">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-5">
                             <div>
-                                <div className="text-[10px] uppercase tracking-[0.35em] text-cyan-400 font-black">Waiting Room</div>
+                                <div className={cn("text-[10px] uppercase tracking-[0.35em] font-black", mode === MODE.SOLO ? "text-violet-400" : "text-cyan-400")}>
+                                    {mode === MODE.SOLO ? 'Deploying Robot' : 'Waiting Room'}
+                                </div>
                                 <div className="mt-2 text-4xl font-black tracking-[0.25em] text-white">{session.roomCode}</div>
                             </div>
                             <div className="flex gap-2">
                                 <IconButton label="Change callsign" onClick={openRename}><Pencil className="w-4 h-4" /></IconButton>
-                                <IconButton label="Copy code" onClick={copyRoomCode}><Clipboard className="w-4 h-4" /></IconButton>
-                                <IconButton label="Share room" onClick={shareRoom}><Share2 className="w-4 h-4" /></IconButton>
+                                {mode !== MODE.SOLO && (
+                                    <>
+                                        <IconButton label="Copy code" onClick={copyRoomCode}><Clipboard className="w-4 h-4" /></IconButton>
+                                        <IconButton label="Share room" onClick={shareRoom}><Share2 className="w-4 h-4" /></IconButton>
+                                    </>
+                                )}
                             </div>
                         </div>
 
                         <div className="grid gap-3 sm:grid-cols-3 mt-5">
                             <StatusTile label="Connection" value={matchStatusText} />
                             <StatusTile label="Players" value={`${connectedCount} / 2`} />
-                            <StatusTile label="Role" value={session.isHost ? 'Host' : 'Guest'} />
+                            <StatusTile
+                                label={mode === MODE.SOLO ? 'Robot Skill' : 'Role'}
+                                value={mode === MODE.SOLO
+                                    ? (difficultyLabel(session.difficulty) ?? 'Normal')
+                                    : (session.isHost ? 'Host' : 'Guest')}
+                            />
                         </div>
 
                         <div className="grid gap-3 sm:grid-cols-2 mt-5">
-                            <PlayerSlot title="Host Player" player={roomState?.players[0]} fallback="Waiting for host" />
-                            <PlayerSlot title="Joined Player" player={roomState?.players[1]} fallback="Waiting for opponent" />
+                            <PlayerSlot title="You" player={roomState?.players[0]} fallback="Taking position" />
+                            <PlayerSlot
+                                title={mode === MODE.SOLO ? 'Robot Opponent' : 'Joined Player'}
+                                player={roomState?.players[1]}
+                                fallback={mode === MODE.SOLO ? 'Booting robot' : 'Waiting for opponent'}
+                            />
                         </div>
 
                         <div className="mt-6 flex flex-col sm:flex-row gap-3">
                             <button
-                                disabled={!session.isHost || connectedCount < 2}
+                                disabled={mode === MODE.SOLO || !session.isHost || connectedCount < 2}
                                 className={cn(
                                     "h-14 flex-1 rounded-lg border font-black uppercase tracking-wider flex items-center justify-center gap-2 transition",
-                                    session.isHost && connectedCount >= 2 ? "border-cyan-500 bg-cyan-500/10 text-cyan-100" : "border-slate-800 bg-slate-900 text-slate-600 cursor-not-allowed"
+                                    mode !== MODE.SOLO && session.isHost && connectedCount >= 2 ? "border-cyan-500 bg-cyan-500/10 text-cyan-100" : "border-slate-800 bg-slate-900 text-slate-600 cursor-not-allowed"
                                 )}
                             >
-                                {screen === 'match-found' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                                {connectedCount >= 2 ? 'Match Starting' : 'Start Match'}
+                                {screen === 'match-found' || mode === MODE.SOLO ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                                {mode === MODE.SOLO ? 'Robot Deploying' : (connectedCount >= 2 ? 'Match Starting' : 'Start Match')}
                             </button>
                             <button onClick={leaveRoom} className="h-14 rounded-lg border border-slate-700 bg-[#0A0B10] px-6 text-slate-300 font-black uppercase tracking-wider hover:border-rose-400">
                                 Leave
@@ -742,9 +886,9 @@ export default function Home() {
                         <div className="flex w-full items-center justify-between max-w-6xl mx-auto pointer-events-auto">
                             <PlayerHud player={gameState.players[0]} fallback="Player 1" side="left" />
                             <div className="px-4 flex-col items-center hidden sm:flex">
-                                <div className="text-[10px] uppercase tracking-tighter text-slate-500 mb-1 font-bold">{mode === 'multi' ? matchStatusText : 'Velocity'}</div>
+                                <div className="text-[10px] uppercase tracking-tighter text-slate-500 mb-1 font-bold">{isOnline ? matchStatusText : 'Velocity'}</div>
                                 <div className="flex items-center gap-3">
-                                    <span className="text-xs font-mono text-slate-400">{mode === 'multi' ? (isMyTurn ? 'Your Turn' : "Opponent's Turn") : 'Neutral'}</span>
+                                    <span className="text-xs font-mono text-slate-400">{isOnline ? (isMyTurn ? 'Your Turn' : "Opponent's Turn") : 'Neutral'}</span>
                                     <div className="w-16 h-4 bg-[#1A1D29] border border-slate-700 rounded flex items-center px-1">
                                         <div className="h-1.5 w-6 bg-slate-500 rounded-sm mx-auto"></div>
                                     </div>
@@ -755,7 +899,7 @@ export default function Home() {
                     </header>
 
                     <div className="flex-grow flex items-center justify-center relative overflow-hidden bg-[#0A0B10] pt-16 sm:pt-20 pb-4">
-                        {connectionStatus === 'reconnecting' && mode === 'multi' && (
+                        {connectionStatus === 'reconnecting' && isOnline && (
                             <div className="absolute top-24 left-1/2 -translate-x-1/2 z-30 rounded border border-amber-400/40 bg-amber-500/10 px-4 py-2 text-xs font-black uppercase tracking-wider text-amber-100 flex items-center gap-2">
                                 <WifiOff className="w-4 h-4" /> Connection Lost
                             </div>
@@ -764,7 +908,7 @@ export default function Home() {
                         {!gameState.winner && !gameState.isFiring && gameState.players.length > 0 && (
                             <div className="absolute top-20 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1.5 pointer-events-none z-10">
                                 <div className={cn("text-[10px] font-bold uppercase tracking-[0.3em] hidden sm:block", isMyTurn ? currentTheme.text : "text-slate-500")}>
-                                    {mode === 'multi' ? (isMyTurn ? 'Your Turn' : `${opponent?.name ?? 'Opponent'} Aiming`) : `Turn: ${activePlayer?.name}`}
+                                    {isOnline ? (isMyTurn ? 'Your Turn' : `${opponent?.name ?? 'Opponent'} Aiming`) : `Turn: ${activePlayer?.name}`}
                                 </div>
                                 {timeLeft !== null && (
                                     <div className={cn(
@@ -786,13 +930,63 @@ export default function Home() {
                                 className="w-full h-full object-cover sm:object-contain mix-blend-screen"
                             />
 
+                            {feed.length > 0 && (
+                                <div className="absolute top-3 left-3 z-10 w-[210px] sm:w-[250px] pointer-events-none hidden sm:block">
+                                    <div className="rounded-lg border border-slate-800/80 bg-[#0A0B10]/70 backdrop-blur-sm p-2.5">
+                                        <div className="text-[9px] font-black uppercase tracking-[0.25em] text-slate-500 mb-1.5">Battle Log</div>
+                                        <ul className="space-y-1">
+                                            {feed.slice(-6).map((entry) => (
+                                                <li key={entry.id} className={cn("text-[10px] leading-snug flex items-start gap-1.5", FEED_TONES[entry.tone] ?? "text-slate-400")}>
+                                                    {entry.robot && <Bot className="w-3 h-3 shrink-0 mt-px text-violet-400" />}
+                                                    <span>{entry.text}</span>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                </div>
+                            )}
+
                             {gameState.winner && (
-                                <div className="absolute inset-0 bg-[#0A0B10]/80 backdrop-blur-md flex items-center justify-center animate-in fade-in duration-500 z-10 p-4">
+                                <div className="absolute inset-0 bg-[#0A0B10]/80 backdrop-blur-md flex items-center justify-center animate-in fade-in duration-500 z-10 p-4 overflow-y-auto">
                                     <div className="text-center p-7 bg-[#11131C] border border-slate-800 rounded-lg shadow-[0_0_50px_rgba(0,0,0,0.5)] max-w-md w-full">
                                         <div className="text-[10px] text-slate-500 font-bold uppercase tracking-[0.3em] mb-2">Match Concluded</div>
                                         <h2 className="text-3xl sm:text-4xl font-black text-white tracking-widest mb-6">
-                                            {gameState.winner.name === 'Draw' ? "DRAW" : `${gameState.winner.name} WINS`}
+                                            {isOnline
+                                                ? describeOutcome(roomState, session?.playerId).toUpperCase()
+                                                : (gameState.winner.name === 'Draw' ? "DRAW" : `${gameState.winner.name} WINS`)}
                                         </h2>
+
+                                        {summary.length > 0 && (
+                                            <div className="mb-6 space-y-2 text-left">
+                                                {summary.map((row) => (
+                                                    <div
+                                                        key={row.id}
+                                                        className={cn(
+                                                            "rounded-lg border p-3",
+                                                            row.isWinner ? "border-emerald-500/50 bg-emerald-500/5" : "border-slate-800 bg-[#0A0B10]"
+                                                        )}
+                                                    >
+                                                        <div className="flex items-center justify-between gap-2">
+                                                            <div className="flex items-center gap-2 min-w-0">
+                                                                <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: row.color }} />
+                                                                <span className="font-black text-white text-sm truncate">{row.name}</span>
+                                                                {row.isRobot && <RobotBadge difficulty={row.difficulty} />}
+                                                                {row.isMe && <span className="text-[9px] font-black uppercase tracking-wider text-slate-500">You</span>}
+                                                            </div>
+                                                            {row.isWinner && (
+                                                                <span className="text-[9px] font-black uppercase tracking-widest text-emerald-400 shrink-0">Winner</span>
+                                                            )}
+                                                        </div>
+                                                        <div className="mt-2 flex gap-4 text-[10px] font-mono text-slate-400">
+                                                            <span>{row.hp} / 100 HP</span>
+                                                            <span>{row.shotsFired} {row.shotsFired === 1 ? 'shot' : 'shots'}</span>
+                                                            <span>{row.survived ? 'Survived' : 'Destroyed'}</span>
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
                                         <button
                                             onClick={handleRestart}
                                             className="w-full h-12 relative group overflow-hidden bg-[#0A0B10] rounded-lg border border-cyan-500 hover:border-cyan-400 text-white font-bold tracking-widest uppercase transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)] hover:shadow-[0_0_20px_rgba(34,211,238,0.4)] active:scale-95 flex items-center justify-center gap-2"
@@ -873,7 +1067,7 @@ export default function Home() {
                                             {gameState.isFiring ? 'WAIT' : 'FIRE'}
                                         </span>
                                         <span className={cn("text-[8px] tracking-widest mt-1 uppercase font-bold", controlsDisabled ? "text-slate-600" : currentTheme.text)}>
-                                            {mode === 'multi' && !isMyTurn ? 'Stand By' : 'Engage'}
+                                            {isOnline && !isMyTurn ? 'Stand By' : 'Engage'}
                                         </span>
                                     </button>
                                 </div>
@@ -883,6 +1077,27 @@ export default function Home() {
                 </>
             )}
         </main>
+    );
+}
+
+const FEED_TONES = {
+    info: "text-slate-400",
+    good: "text-emerald-300",
+    bad: "text-rose-300",
+    warn: "text-amber-300",
+};
+
+function RobotBadge({ difficulty, className }) {
+    return (
+        <span
+            title={difficulty ? `Robot opponent — ${difficulty}` : 'Robot opponent'}
+            className={cn(
+                "inline-flex items-center gap-1 rounded border border-violet-500/60 bg-violet-500/15 px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wider text-violet-200 shrink-0",
+                className
+            )}
+        >
+            <Bot className="w-2.5 h-2.5" /> AI{difficulty ? ` · ${difficulty}` : ''}
+        </span>
     );
 }
 
@@ -908,9 +1123,12 @@ function PlayerSlot({ title, player, fallback }) {
     return (
         <div className="rounded-lg border border-slate-800 bg-[#0A0B10] p-4">
             <div className="text-[10px] uppercase tracking-widest text-slate-500 font-black">{title}</div>
-            <div className="mt-3 flex items-center justify-between">
-                <span className="font-black text-white">{player?.name ?? fallback}</span>
-                <span className={cn("text-[10px] uppercase tracking-wider font-black", player?.connected ? "text-emerald-400" : "text-slate-600")}>
+            <div className="mt-3 flex items-center justify-between gap-2">
+                <span className="font-black text-white flex items-center gap-2 min-w-0">
+                    <span className="truncate">{player?.name ?? fallback}</span>
+                    {player?.isRobot && <RobotBadge difficulty={difficultyLabel(player.robotDifficulty)} />}
+                </span>
+                <span className={cn("text-[10px] uppercase tracking-wider font-black shrink-0", player?.connected ? "text-emerald-400" : "text-slate-600")}>
                     {player?.connected ? 'Ready' : 'Open'}
                 </span>
             </div>
@@ -930,7 +1148,10 @@ function PlayerHud({ player, fallback, side }) {
     const isRight = side === 'right';
     return (
         <div className={cn("flex flex-col flex-1 max-w-[200px]", isRight && "items-end")}>
-            <span className={cn("text-[10px] uppercase tracking-widest font-bold mb-1", isRight ? "text-rose-400" : "text-cyan-400")}>{player?.name || fallback}</span>
+            <span className={cn("text-[10px] uppercase tracking-widest font-bold mb-1 flex items-center gap-1.5 max-w-full", isRight ? "text-rose-400 flex-row-reverse" : "text-cyan-400")}>
+                <span className="truncate">{player?.name || fallback}</span>
+                {player?.isRobot && <RobotBadge />}
+            </span>
             <div className={cn("w-full h-2 bg-slate-800 rounded-full overflow-hidden border border-slate-700", isRight && "flex justify-end")}>
                 <div className={cn("h-full transition-all duration-300", isRight ? "bg-gradient-to-l from-rose-600 to-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.5)]" : "bg-gradient-to-r from-cyan-600 to-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.5)]")} style={{ width: `${player?.hp ?? 100}%` }} />
             </div>
